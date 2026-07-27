@@ -2,16 +2,19 @@
 #
 # iac-queue - a small, provider-neutral, directory-backed task queue.
 #
-# The caller supplies an opaque key and external ID. iac-queue assigns its own
-# internal queue ID and never interprets the external ID or message.
+# The caller supplies an opaque key and external ID. The key is hashed before
+# use and is never stored or displayed in its original form. iac-queue assigns
+# its own internal queue ID and never interprets the external ID or message.
 #
 
 set -euo pipefail
 
 PROGRAM="iac-queue"
-VERSION="0.4.0"
+VERSION="0.6.0"
 MAX_MESSAGES="${IAC_QUEUE_MAX_MESSAGES:-10}"
 MAX_MESSAGE_BYTES="${IAC_QUEUE_MAX_MESSAGE_BYTES:-8192}"
+AUTO_ABORT_DAYS=366
+PRUNE_MINIMUM_DAYS=31
 
 SELF_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SELF_DIR="$(dirname "$SELF_PATH")"
@@ -28,19 +31,24 @@ QUEUE_ROOT="$ROOT/queue"
 BACKLOG_DIR="$QUEUE_ROOT/backlog"
 INPROGRESS_DIR="$QUEUE_ROOT/inprogress"
 COMPLETED_DIR="$QUEUE_ROOT/completed"
+ABORT_DIR="$QUEUE_ROOT/abort"
 LOG_DIR="$ROOT/logs"
 LOG_FILE="$LOG_DIR/iac-queue.log"
 LOCK_FILE="$LOG_DIR/iac-queue.lock"
 LOCK_DIR="$LOG_DIR/iac-queue.lock.d"
 NEXT_ID_FILE="$QUEUE_ROOT/next_id"
+NAMESPACE_DIR="$QUEUE_ROOT/namespaces"
 LOCK_METHOD=""
 TEMP_PAYLOAD_FILE=""
 TEMP_RECORD_DIR=""
 TEMP_MESSAGE_DIR=""
+KEY_FILE_OPTION=""
+RESOLVED_KEY_HASH=""
 
 usage() {
     cat <<'EOF'
 Usage:
+  iac-queue [--key-file FILE] COMMAND ...
   iac-queue install TARGET
   iac-queue add KEY EXTERNAL_ID [MESSAGE...]
   iac-queue add KEY EXTERNAL_ID --file FILE
@@ -56,8 +64,20 @@ Usage:
   iac-queue backlog KEY [--long]
   iac-queue inprogress KEY [--long]
   iac-queue completed KEY [--long]
+  iac-queue abort KEY [--long]
   iac-queue show KEY EXTERNAL_ID
+  iac-queue label KEY [LABEL|--clear]
   iac-queue version
+
+Key input:
+  Commands that require KEY may receive it in one of three ways:
+
+      iac-queue COMMAND KEY ...
+      iac-queue --key-file FILE COMMAND ...
+      IAC_QUEUE_KEY="..." iac-queue COMMAND ...
+
+  When --key-file or IAC_QUEUE_KEY is used, omit KEY after COMMAND.
+  --key-file takes precedence over IAC_QUEUE_KEY.
 
 Install:
   TARGET is the parent directory. The installation is created at:
@@ -82,11 +102,14 @@ Queue behavior:
   shift     Read and remove the oldest message.
 
 Listings are FIFO. Without --long, listings print one external ID per line.
+The abort queue is read-only and contains automatically expired tasks.
 
 Every task belongs to one caller-defined key. The key is mandatory for every
 task operation and listing. There is no unfiltered listing command.
 
 Keys are logical namespaces and filters, not authentication credentials.
+Original keys are not stored or displayed. Optional labels are descriptive
+only and are never accepted in place of a key.
 
 The caller chooses an arbitrary, single-line external ID. iac-queue assigns
 its own internal queue ID. External-ID uniqueness is scoped to the key.
@@ -99,8 +122,8 @@ Defaults per task:
   Maximum messages:       10
   Maximum message bytes:  8192
 
-Completed and cancelled tasks have their message payload files removed from
-the queue record.
+Completed, cancelled, and aborted tasks have their message payload files
+removed from the queue record.
 EOF
 }
 
@@ -138,11 +161,15 @@ ensure_runtime() {
         "$BACKLOG_DIR" \
         "$INPROGRESS_DIR" \
         "$COMPLETED_DIR" \
+        "$ABORT_DIR" \
+        "$NAMESPACE_DIR" \
         "$LOG_DIR"
 }
 
 acquire_lock() {
     local attempt
+
+    [[ -n "$LOCK_METHOD" ]] && return 0
 
     if command -v flock >/dev/null 2>&1; then
         exec 9>"$LOCK_FILE"
@@ -192,25 +219,117 @@ trap cleanup_on_exit EXIT
 validate_external_id() {
     local external_id="$1"
 
-    [[ -n "$external_id" ]] || die "external ID cannot be empty"
-
-    if [[ "$external_id" == *$'\n'* ||
-          "$external_id" == *$'\r'* ||
-          "$external_id" == *$'\t'* ]]; then
-        die "external ID must be a single line without tabs"
-    fi
+    [[ "$external_id" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] || {
+        die "external ID may contain only letters, numbers, '.', '_', '+', and '-'"
+    }
 }
 
 validate_key() {
     local key="$1"
+    local invalid_count
 
     [[ -n "$key" ]] || die "key cannot be empty"
+    invalid_count="$(
+        printf '%s' "$key" |
+            LC_ALL=C tr -d '\41-\176' |
+            wc -c |
+            tr -d '[:space:]'
+    )"
+    [[ "$invalid_count" == "0" ]] || {
+        die "key must contain only printable ASCII without whitespace"
+    }
+}
 
-    if [[ "$key" == *$'\n'* ||
-          "$key" == *$'\r'* ||
-          "$key" == *$'\t'* ]]; then
-        die "key must be a single line without tabs"
+validate_key_hash() {
+    local key_hash="$1"
+
+    [[ "$key_hash" =~ ^[0-9a-f]{64}$ ]] || {
+        die "invalid internal key hash"
+    }
+}
+
+hash_key() {
+    local key="$1"
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        printf '%s' "$key" | sha256sum | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        printf '%s' "$key" | shasum -a 256 | awk '{print $1}'
+    else
+        die "sha256sum or shasum is required"
     fi
+}
+
+read_key_file() {
+    local key_file="$1"
+    local key
+
+    [[ -f "$key_file" ]] || die "key file not found"
+    [[ -r "$key_file" ]] || die "key file is not readable"
+
+    key="$(cat -- "$key_file")"
+    [[ -n "$key" ]] || die "key file is empty"
+    validate_key "$key"
+    printf '%s\n' "$key"
+}
+
+resolve_command_key() {
+    local supplied_key=""
+
+    if [[ -n "$KEY_FILE_OPTION" ]]; then
+        supplied_key="$(read_key_file "$KEY_FILE_OPTION")"
+    elif [[ -n "${IAC_QUEUE_KEY+x}" ]]; then
+        supplied_key="$IAC_QUEUE_KEY"
+        [[ -n "$supplied_key" ]] || die "IAC_QUEUE_KEY is empty"
+        validate_key "$supplied_key"
+    else
+        [[ $# -ge 1 ]] || die "this command requires a key"
+        supplied_key="$1"
+        validate_key "$supplied_key"
+        COMMAND_KEY_ARGUMENT_CONSUMED="true"
+    fi
+
+    RESOLVED_KEY_HASH="$(hash_key "$supplied_key")"
+    validate_key_hash "$RESOLVED_KEY_HASH"
+}
+
+namespace_path() {
+    local key_hash="$1"
+
+    validate_key_hash "$key_hash"
+    printf '%s/%s\n' "$NAMESPACE_DIR" "$key_hash"
+}
+
+namespace_label() {
+    local key_hash="$1"
+    local label_file
+    local label=""
+
+    label_file="$(namespace_path "$key_hash")/label"
+    if [[ -f "$label_file" ]]; then
+        IFS= read -r label < "$label_file" || true
+    fi
+    printf '%s\n' "${label:--}"
+}
+
+validate_label() {
+    local label="$1"
+    local byte_count
+    local invalid_count
+
+    [[ -n "$label" ]] || die "label cannot be empty; use --clear"
+    byte_count="$(printf '%s' "$label" | wc -c | tr -d '[:space:]')"
+    (( byte_count <= 256 )) || die "label exceeds maximum size of 256 bytes"
+
+    invalid_count="$(
+        printf '%s' "$label" |
+            LC_ALL=C tr -d '\40-\176' |
+            wc -c |
+            tr -d '[:space:]'
+    )"
+    [[ "$invalid_count" == "0" ]] || {
+        die "label must contain printable ASCII without line breaks"
+    }
 }
 
 append_history() {
@@ -228,18 +347,46 @@ append_history() {
 
 write_log() {
     local action="$1"
-    local key="$2"
-    local external_id="$3"
-    local detail="${4:-}"
+    local external_id="$2"
+    local detail="${3:-}"
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\n' \
         "$(now_iso)" \
         "$action" \
-        "$key" \
         "$external_id" \
         "$(actor_name)" \
         "$(sanitize_note "$detail")" \
         >> "$LOG_FILE"
+}
+
+migrate_legacy_keys() {
+    local state_dir
+    local item_path
+    local legacy_key
+    local key_hash
+    local temp_hash_file
+
+    for state_dir in \
+        "$BACKLOG_DIR" \
+        "$INPROGRESS_DIR" \
+        "$COMPLETED_DIR" \
+        "$ABORT_DIR"; do
+        shopt -s nullglob
+        for item_path in "$state_dir"/*; do
+            [[ -d "$item_path" ]] || continue
+            [[ -f "$item_path/key" ]] || continue
+
+            IFS= read -r legacy_key < "$item_path/key" || true
+            validate_key "$legacy_key"
+            key_hash="$(hash_key "$legacy_key")"
+            temp_hash_file="$item_path/.key_sha256.$$"
+            printf '%s\n' "$key_hash" > "$temp_hash_file"
+            mv -- "$temp_hash_file" "$item_path/key_sha256"
+            rm -f -- "$item_path/key"
+            mkdir -p -- "$(namespace_path "$key_hash")"
+        done
+        shopt -u nullglob
+    done
 }
 
 allocate_queue_id() {
@@ -264,34 +411,37 @@ allocate_queue_id() {
 }
 
 find_item() {
-    local key="$1"
+    local key_hash="$1"
     local external_id="$2"
     local state
     local state_dir
     local candidate
     local candidate_external_id
-    local candidate_key
+    local candidate_key_hash
+
+    validate_key_hash "$key_hash"
 
     ITEM_STATE=""
     ITEM_PATH=""
     ITEM_QUEUE_ID=""
 
-    for state in backlog inprogress completed; do
+    for state in backlog inprogress completed abort; do
         case "$state" in
             backlog) state_dir="$BACKLOG_DIR" ;;
             inprogress) state_dir="$INPROGRESS_DIR" ;;
             completed) state_dir="$COMPLETED_DIR" ;;
+            abort) state_dir="$ABORT_DIR" ;;
         esac
 
         shopt -s nullglob
         for candidate in "$state_dir"/*; do
             [[ -d "$candidate" ]] || continue
-            [[ -f "$candidate/key" ]] || continue
+            [[ -f "$candidate/key_sha256" ]] || continue
             [[ -f "$candidate/external_id" ]] || continue
-            IFS= read -r candidate_key < "$candidate/key" || true
+            IFS= read -r candidate_key_hash < "$candidate/key_sha256" || true
             IFS= read -r candidate_external_id < "$candidate/external_id" || true
 
-            if [[ "$candidate_key" == "$key" &&
+            if [[ "$candidate_key_hash" == "$key_hash" &&
                   "$candidate_external_id" == "$external_id" ]]; then
                 ITEM_STATE="$state"
                 ITEM_PATH="$candidate"
@@ -462,6 +612,66 @@ flush_messages() {
     FLUSHED_MESSAGES="$count"
 }
 
+abort_stale_tasks() {
+    local threshold_days="$1"
+    local reason="$2"
+    local now_epoch
+    local threshold_seconds
+    local state
+    local state_dir
+    local item_path
+    local queue_id
+    local created_epoch
+    local age_seconds
+    local external_id
+    local destination
+
+    MAINTENANCE_ABORTED_COUNT=0
+    now_epoch="$(date '+%s')"
+    threshold_seconds="$((threshold_days * 86400))"
+
+    for state in backlog inprogress; do
+        case "$state" in
+            backlog) state_dir="$BACKLOG_DIR" ;;
+            inprogress) state_dir="$INPROGRESS_DIR" ;;
+        esac
+
+        shopt -s nullglob
+        for item_path in "$state_dir"/*; do
+            [[ -d "$item_path" ]] || continue
+            [[ -f "$item_path/created_epoch" ]] || continue
+            IFS= read -r created_epoch < "$item_path/created_epoch" || true
+            [[ "$created_epoch" =~ ^[0-9]+$ ]] || continue
+
+            age_seconds="$((now_epoch - created_epoch))"
+            (( age_seconds >= threshold_seconds )) || continue
+
+            [[ -f "$item_path/key_sha256" ]] || continue
+            [[ -f "$item_path/external_id" ]] || continue
+            IFS= read -r external_id < "$item_path/external_id" || true
+            queue_id="$(basename "$item_path")"
+
+            flush_messages "$item_path"
+            if (( FLUSHED_MESSAGES > 0 )); then
+                append_history "$item_path" "messages-flushed" \
+                    "$FLUSHED_MESSAGES message(s)"
+            fi
+
+            printf '%s\n' "aborted" > "$item_path/result"
+            printf '%s\n' "$(now_iso)" > "$item_path/updated_at"
+            append_history "$item_path" "aborted" \
+                "$reason after $threshold_days day(s)"
+
+            destination="$ABORT_DIR/$queue_id"
+            mv -- "$item_path" "$destination"
+            write_log "aborted" "$external_id" \
+                "$queue_id $reason after $threshold_days day(s)"
+            MAINTENANCE_ABORTED_COUNT=$((MAINTENANCE_ABORTED_COUNT + 1))
+        done
+        shopt -u nullglob
+    done
+}
+
 append_gitignore_entry() {
     local gitignore_file="$1"
     local entry="$2"
@@ -499,12 +709,16 @@ cmd_install() {
         "$install_root/logs" \
         "$install_root/queue/backlog" \
         "$install_root/queue/inprogress" \
-        "$install_root/queue/completed"
+        "$install_root/queue/completed" \
+        "$install_root/queue/abort" \
+        "$install_root/queue/namespaces"
 
     touch \
         "$install_root/queue/backlog/.gitkeep" \
         "$install_root/queue/inprogress/.gitkeep" \
-        "$install_root/queue/completed/.gitkeep"
+        "$install_root/queue/completed/.gitkeep" \
+        "$install_root/queue/abort/.gitkeep" \
+        "$install_root/queue/namespaces/.gitkeep"
 
     if [[ ! -e "$destination" ||
           "$SELF_PATH" != "$(readlink -f "$destination")" ]]; then
@@ -535,7 +749,7 @@ cmd_install() {
 cmd_add() {
     [[ $# -ge 2 ]] || die "add requires a key and external ID"
 
-    local key="$1"
+    local key_hash="$1"
     local external_id="$2"
     shift 2
 
@@ -543,16 +757,16 @@ cmd_add() {
     local created_at
     local initial_payload
 
-    validate_key "$key"
+    validate_key_hash "$key_hash"
     validate_external_id "$external_id"
 
     ensure_runtime
     acquire_lock
 
-    if find_item "$key" "$external_id"; then
+    if find_item "$key_hash" "$external_id"; then
         printf '%s already exists as %s in %s; add ignored.\n' \
             "$external_id" "$ITEM_QUEUE_ID" "$ITEM_STATE"
-        write_log "add-ignored" "$key" "$external_id" \
+        write_log "add-ignored" "$external_id" \
             "$ITEM_QUEUE_ID already in $ITEM_STATE"
         return 0
     fi
@@ -562,9 +776,10 @@ cmd_add() {
     TEMP_RECORD_DIR="$temp_path"
     created_at="$(now_iso)"
 
-    printf '%s\n' "$key" > "$temp_path/key"
+    printf '%s\n' "$key_hash" > "$temp_path/key_sha256"
     printf '%s\n' "$external_id" > "$temp_path/external_id"
     printf '%s\n' "$created_at" > "$temp_path/created_at"
+    printf '%s\n' "$(date '+%s')" > "$temp_path/created_epoch"
     printf '%s\n' "$QUEUE_NUMBER" > "$temp_path/created_order"
     printf '%s\n' "$created_at" > "$temp_path/updated_at"
     : > "$temp_path/result"
@@ -585,36 +800,37 @@ cmd_add() {
 
     mv -- "$temp_path" "$BACKLOG_DIR/$QUEUE_ID"
     TEMP_RECORD_DIR=""
+    mkdir -p -- "$(namespace_path "$key_hash")"
 
-    write_log "added" "$key" "$external_id" "$QUEUE_ID backlog"
-    printf '%s added to key %s backlog as %s.\n' \
-        "$external_id" "$key" "$QUEUE_ID"
+    write_log "added" "$external_id" "$QUEUE_ID backlog"
+    printf '%s added to backlog as %s.\n' "$external_id" "$QUEUE_ID"
 }
 
 cmd_cancel() {
     [[ $# -ge 2 ]] || die "cancel requires a key and external ID"
 
-    local key="$1"
+    local key_hash="$1"
     local external_id="$2"
     shift 2
     local note="$*"
     local destination
 
-    validate_key "$key"
+    validate_key_hash "$key_hash"
     validate_external_id "$external_id"
     ensure_runtime
     acquire_lock
 
-    if ! find_item "$key" "$external_id"; then
+    if ! find_item "$key_hash" "$external_id"; then
         printf '%s does not exist; cancel ignored.\n' "$external_id"
-        write_log "cancel-ignored" "$key" "$external_id" "not found"
+        write_log "cancel-ignored" "$external_id" "not found"
         return 0
     fi
 
-    if [[ "$ITEM_STATE" == "completed" ]]; then
-        printf '%s is already completed; cancel ignored.\n' "$external_id"
-        write_log "cancel-ignored" "$key" "$external_id" \
-            "$ITEM_QUEUE_ID already completed"
+    if [[ "$ITEM_STATE" == "completed" || "$ITEM_STATE" == "abort" ]]; then
+        printf '%s is already terminal in %s; cancel ignored.\n' \
+            "$external_id" "$ITEM_STATE"
+        write_log "cancel-ignored" "$external_id" \
+            "$ITEM_QUEUE_ID already in $ITEM_STATE"
         return 0
     fi
 
@@ -630,7 +846,7 @@ cmd_cancel() {
     printf '%s\n' "$(now_iso)" > "$destination/updated_at"
     append_history "$destination" "cancelled" "$note"
 
-    write_log "cancelled" "$key" "$external_id" "$ITEM_QUEUE_ID $note"
+    write_log "cancelled" "$external_id" "$ITEM_QUEUE_ID $note"
     printf '%s (%s) moved to completed as cancelled.\n' \
         "$external_id" "$ITEM_QUEUE_ID"
 }
@@ -638,19 +854,19 @@ cmd_cancel() {
 cmd_start() {
     [[ $# -ge 2 ]] || die "start requires a key and external ID"
 
-    local key="$1"
+    local key_hash="$1"
     local external_id="$2"
     shift 2
     local note="$*"
     local destination
 
-    validate_key "$key"
+    validate_key_hash "$key_hash"
     validate_external_id "$external_id"
     ensure_runtime
     acquire_lock
 
-    find_item "$key" "$external_id" || {
-        die "task '$external_id' does not exist for key '$key'"
+    find_item "$key_hash" "$external_id" || {
+        die "task '$external_id' does not exist for the supplied key"
     }
 
     case "$ITEM_STATE" in
@@ -659,19 +875,24 @@ cmd_start() {
             mv -- "$ITEM_PATH" "$destination"
             printf '%s\n' "$(now_iso)" > "$destination/updated_at"
             append_history "$destination" "started" "$note"
-            write_log "started" "$key" "$external_id" "$ITEM_QUEUE_ID $note"
+            write_log "started" "$external_id" "$ITEM_QUEUE_ID $note"
             printf '%s (%s) moved to inprogress.\n' \
                 "$external_id" "$ITEM_QUEUE_ID"
             ;;
         inprogress)
             printf '%s is already inprogress; start ignored.\n' "$external_id"
-            write_log "start-ignored" "$key" "$external_id" \
+            write_log "start-ignored" "$external_id" \
                 "$ITEM_QUEUE_ID already inprogress"
             ;;
         completed)
             printf '%s is already completed; start ignored.\n' "$external_id"
-            write_log "start-ignored" "$key" "$external_id" \
+            write_log "start-ignored" "$external_id" \
                 "$ITEM_QUEUE_ID already completed"
+            ;;
+        abort)
+            printf '%s is aborted; start ignored.\n' "$external_id"
+            write_log "start-ignored" "$external_id" \
+                "$ITEM_QUEUE_ID already aborted"
             ;;
     esac
 }
@@ -679,30 +900,34 @@ cmd_start() {
 cmd_complete() {
     [[ $# -ge 2 ]] || die "complete requires a key and external ID"
 
-    local key="$1"
+    local key_hash="$1"
     local external_id="$2"
     shift 2
     local note="$*"
     local destination
     local existing_result
 
-    validate_key "$key"
+    validate_key_hash "$key_hash"
     validate_external_id "$external_id"
     ensure_runtime
     acquire_lock
 
-    find_item "$key" "$external_id" || {
-        die "task '$external_id' does not exist for key '$key'"
+    find_item "$key_hash" "$external_id" || {
+        die "task '$external_id' does not exist for the supplied key"
     }
 
     if [[ "$ITEM_STATE" == "completed" ]]; then
         existing_result="$(cat "$ITEM_PATH/result" 2>/dev/null || true)"
         printf '%s is already completed (%s); complete ignored.\n' \
             "$external_id" "${existing_result:-unknown}"
-        write_log "complete-ignored" "$key" "$external_id" \
+        write_log "complete-ignored" "$external_id" \
             "$ITEM_QUEUE_ID already completed"
         return 0
     fi
+
+    [[ "$ITEM_STATE" != "abort" ]] || {
+        die "task '$external_id' is aborted and cannot be completed"
+    }
 
     [[ "$ITEM_STATE" == "inprogress" ]] || {
         die "task '$external_id' is in backlog; run start before complete"
@@ -720,22 +945,24 @@ cmd_complete() {
     printf '%s\n' "$(now_iso)" > "$destination/updated_at"
     append_history "$destination" "completed" "$note"
 
-    write_log "completed" "$key" "$external_id" "$ITEM_QUEUE_ID $note"
+    write_log "completed" "$external_id" "$ITEM_QUEUE_ID $note"
     printf '%s (%s) moved to completed as successful.\n' \
         "$external_id" "$ITEM_QUEUE_ID"
 }
 
 require_open_task() {
-    local key="$1"
+    local key_hash="$1"
     local external_id="$2"
 
-    find_item "$key" "$external_id" || {
-        die "task '$external_id' does not exist for key '$key'"
+    find_item "$key_hash" "$external_id" || {
+        die "task '$external_id' does not exist for the supplied key"
     }
 
-    [[ "$ITEM_STATE" != "completed" ]] || {
-        die "task '$external_id' is completed; its message queue is closed"
-    }
+    case "$ITEM_STATE" in
+        completed|abort)
+            die "task '$external_id' is in $ITEM_STATE; its message queue is closed"
+            ;;
+    esac
 }
 
 cmd_push() {
@@ -743,16 +970,16 @@ cmd_push() {
         die "push requires a key, external ID, and message"
     }
 
-    local key="$1"
+    local key_hash="$1"
     local external_id="$2"
     shift 2
     local payload_file
 
-    validate_key "$key"
+    validate_key_hash "$key_hash"
     validate_external_id "$external_id"
     ensure_runtime
     acquire_lock
-    require_open_task "$key" "$external_id"
+    require_open_task "$key_hash" "$external_id"
 
     payload_file="$ITEM_PATH/.incoming-message.$$"
     TEMP_PAYLOAD_FILE="$payload_file"
@@ -764,7 +991,7 @@ cmd_push() {
     TEMP_PAYLOAD_FILE=""
     printf '%s\n' "$(now_iso)" > "$ITEM_PATH/updated_at"
     append_history "$ITEM_PATH" "message-pushed" "$MESSAGE_ID"
-    write_log "message-pushed" "$key" "$external_id" \
+    write_log "message-pushed" "$external_id" \
         "$ITEM_QUEUE_ID $MESSAGE_ID"
 
     printf '%s pushed to %s (%s).\n' \
@@ -774,14 +1001,14 @@ cmd_push() {
 cmd_peek() {
     [[ $# -eq 2 ]] || die "peek requires a key and external ID"
 
-    local key="$1"
+    local key_hash="$1"
     local external_id="$2"
 
-    validate_key "$key"
+    validate_key_hash "$key_hash"
     validate_external_id "$external_id"
     ensure_runtime
     acquire_lock
-    require_open_task "$key" "$external_id"
+    require_open_task "$key_hash" "$external_id"
 
     if ! find_oldest_message "$ITEM_PATH"; then
         printf '%s: message queue is empty for task %s\n' \
@@ -795,14 +1022,14 @@ cmd_peek() {
 cmd_shift() {
     [[ $# -eq 2 ]] || die "shift requires a key and external ID"
 
-    local key="$1"
+    local key_hash="$1"
     local external_id="$2"
 
-    validate_key "$key"
+    validate_key_hash "$key_hash"
     validate_external_id "$external_id"
     ensure_runtime
     acquire_lock
-    require_open_task "$key" "$external_id"
+    require_open_task "$key_hash" "$external_id"
 
     if ! find_oldest_message "$ITEM_PATH"; then
         printf '%s: message queue is empty for task %s\n' \
@@ -815,7 +1042,7 @@ cmd_shift() {
     rmdir -- "$OLDEST_MESSAGE_PATH"
     printf '%s\n' "$(now_iso)" > "$ITEM_PATH/updated_at"
     append_history "$ITEM_PATH" "message-shifted" "$OLDEST_MESSAGE_ID"
-    write_log "message-shifted" "$key" "$external_id" \
+    write_log "message-shifted" "$external_id" \
         "$ITEM_QUEUE_ID $OLDEST_MESSAGE_ID"
 }
 
@@ -825,21 +1052,25 @@ list_state() {
 
     [[ $# -ge 1 ]] || die "$state requires a key"
 
-    local key="$1"
+    local key_hash="$1"
     shift
     local long_output="false"
     local state_dir
     local item_path
     local queue_id
     local external_id
-    local item_key
+    local item_key_hash
+    local label
     local order
     local created
+    local created_epoch
+    local age_days
+    local now_epoch
     local result
     local messages
     local rows=()
 
-    validate_key "$key"
+    validate_key_hash "$key_hash"
 
     if [[ $# -gt 0 ]]; then
         [[ $# -eq 1 && "$1" == "--long" ]] || {
@@ -852,32 +1083,36 @@ list_state() {
         backlog) state_dir="$BACKLOG_DIR" ;;
         inprogress) state_dir="$INPROGRESS_DIR" ;;
         completed) state_dir="$COMPLETED_DIR" ;;
+        abort) state_dir="$ABORT_DIR" ;;
         *) die "unknown queue state: $state" ;;
     esac
 
     ensure_runtime
     acquire_lock
+    now_epoch="$(date '+%s')"
 
     shopt -s nullglob
     for item_path in "$state_dir"/*; do
         [[ -d "$item_path" ]] || continue
         queue_id="$(basename "$item_path")"
-        [[ -f "$item_path/key" ]] || continue
+        [[ -f "$item_path/key_sha256" ]] || continue
         [[ -f "$item_path/external_id" ]] || continue
-        item_key="$(cat "$item_path/key")"
-        [[ "$item_key" == "$key" ]] || continue
+        item_key_hash="$(cat "$item_path/key_sha256")"
+        [[ "$item_key_hash" == "$key_hash" ]] || continue
         order="$(cat "$item_path/created_order" 2>/dev/null || printf '0')"
         rows+=("$order"$'\t'"$queue_id")
     done
     shopt -u nullglob
 
     if [[ "$long_output" == "true" ]]; then
-        printf 'QUEUE_ID\tKEY\tEXTERNAL_ID\tSTATE\tCREATED\tRESULT\tMESSAGES\n'
+        printf 'QUEUE_ID\tLABEL\tEXTERNAL_ID\tSTATE\tCREATED\tAGE_DAYS\tRESULT\tMESSAGES\n'
     fi
 
     if [[ ${#rows[@]} -eq 0 ]]; then
         return 0
     fi
+
+    label="$(namespace_label "$key_hash")"
 
     while IFS=$'\t' read -r order queue_id; do
         item_path="$state_dir/$queue_id"
@@ -885,14 +1120,21 @@ list_state() {
 
         if [[ "$long_output" == "true" ]]; then
             created="$(cat "$item_path/created_at" 2>/dev/null || true)"
+            created_epoch="$(cat "$item_path/created_epoch" 2>/dev/null || true)"
+            if [[ "$created_epoch" =~ ^[0-9]+$ ]]; then
+                age_days="$(((now_epoch - created_epoch) / 86400))"
+            else
+                age_days="-"
+            fi
             result="$(cat "$item_path/result" 2>/dev/null || true)"
             messages="$(message_count "$item_path")"
-            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
                 "$queue_id" \
-                "$key" \
+                "$label" \
                 "$external_id" \
                 "$state" \
                 "$created" \
+                "$age_days" \
                 "${result:--}" \
                 "$messages"
         else
@@ -904,41 +1146,111 @@ list_state() {
 cmd_show() {
     [[ $# -eq 2 ]] || die "show requires a key and external ID"
 
-    local key="$1"
+    local key_hash="$1"
     local external_id="$2"
     local created
+    local created_epoch
+    local age_days
     local updated
     local result
     local messages
+    local label
 
-    validate_key "$key"
+    validate_key_hash "$key_hash"
     validate_external_id "$external_id"
 
     ensure_runtime
     acquire_lock
-    find_item "$key" "$external_id" || {
-        die "task '$external_id' does not exist for key '$key'"
+    find_item "$key_hash" "$external_id" || {
+        die "task '$external_id' does not exist for the supplied key"
     }
 
     created="$(cat "$ITEM_PATH/created_at" 2>/dev/null || true)"
+    created_epoch="$(cat "$ITEM_PATH/created_epoch" 2>/dev/null || true)"
+    if [[ "$created_epoch" =~ ^[0-9]+$ ]]; then
+        age_days="$((($(date '+%s') - created_epoch) / 86400))"
+    else
+        age_days="-"
+    fi
     updated="$(cat "$ITEM_PATH/updated_at" 2>/dev/null || true)"
     result="$(cat "$ITEM_PATH/result" 2>/dev/null || true)"
     messages="$(message_count "$ITEM_PATH")"
+    label="$(namespace_label "$key_hash")"
 
     printf 'Queue ID: %s\n' "$ITEM_QUEUE_ID"
-    printf 'Key: %s\n' "$key"
+    printf 'Label: %s\n' "$label"
     printf 'External ID: %s\n' "$external_id"
     printf 'State: %s\n' "$ITEM_STATE"
     printf 'Result: %s\n' "${result:--}"
     printf 'Created: %s\n' "$created"
+    printf 'Created epoch: %s\n' "${created_epoch:--}"
+    printf 'Age days: %s\n' "$age_days"
     printf 'Updated: %s\n' "$updated"
     printf 'Messages: %s\n' "$messages"
     printf '\nHistory:\n'
     cat "$ITEM_PATH/history.log"
 }
 
+cmd_label() {
+    [[ $# -ge 1 && $# -le 2 ]] || {
+        die "label requires a key and optional LABEL or --clear"
+    }
+
+    local key_hash="$1"
+    local namespace
+    local label_file
+    local temp_label
+
+    validate_key_hash "$key_hash"
+    ensure_runtime
+    acquire_lock
+
+    namespace="$(namespace_path "$key_hash")"
+    label_file="$namespace/label"
+
+    if [[ $# -eq 1 ]]; then
+        namespace_label "$key_hash"
+        return 0
+    fi
+
+    if [[ "$2" == "--clear" ]]; then
+        rm -f -- "$label_file"
+        printf 'Label cleared.\n'
+        write_log "label-cleared" "-" ""
+        return 0
+    fi
+
+    validate_label "$2"
+    mkdir -p -- "$namespace"
+    temp_label="$namespace/.label.$$"
+    printf '%s\n' "$2" > "$temp_label"
+    mv -- "$temp_label" "$label_file"
+    printf 'Label set: %s\n' "$2"
+    write_log "label-set" "-" "$2"
+}
+
+cmd_prune() {
+    [[ $# -eq 0 ]] || die "--prune does not accept arguments"
+
+    ensure_runtime
+    acquire_lock
+    migrate_legacy_keys
+    abort_stale_tasks "$PRUNE_MINIMUM_DAYS" "manual-prune"
+    printf 'Pruned %s task(s) aged at least %s days.\n' \
+        "$MAINTENANCE_ABORTED_COUNT" "$PRUNE_MINIMUM_DAYS"
+}
+
 main() {
-    local command="${1:-}"
+    local command
+    local command_uses_key="false"
+
+    if [[ "${1:-}" == "--key-file" ]]; then
+        [[ $# -ge 3 ]] || die "--key-file requires FILE followed by COMMAND"
+        KEY_FILE_OPTION="$2"
+        shift 2
+    fi
+
+    command="${1:-}"
 
     if [[ -z "$command" ]]; then
         usage
@@ -946,6 +1258,34 @@ main() {
     fi
 
     shift
+
+    case "$command" in
+        add|cancel|start|complete|push|peek|shift|backlog|inprogress|completed|abort|show|label)
+            command_uses_key="true"
+            ;;
+    esac
+
+    if [[ "$command_uses_key" == "true" ]]; then
+        COMMAND_KEY_ARGUMENT_CONSUMED="false"
+        resolve_command_key "$@"
+        if [[ "$COMMAND_KEY_ARGUMENT_CONSUMED" == "true" ]]; then
+            shift
+        fi
+        set -- "$RESOLVED_KEY_HASH" "$@"
+    elif [[ -n "$KEY_FILE_OPTION" ]]; then
+        die "--key-file is not supported for '$command'"
+    fi
+
+    case "$command" in
+        install|version|--version|-V|help|--help|-h|--prune)
+            ;;
+        *)
+            ensure_runtime
+            acquire_lock
+            migrate_legacy_keys
+            abort_stale_tasks "$AUTO_ABORT_DAYS" "automatic-expiration"
+            ;;
+    esac
 
     case "$command" in
         install) cmd_install "$@" ;;
@@ -959,7 +1299,10 @@ main() {
         backlog) list_state "backlog" "$@" ;;
         inprogress) list_state "inprogress" "$@" ;;
         completed) list_state "completed" "$@" ;;
+        abort) list_state "abort" "$@" ;;
         show) cmd_show "$@" ;;
+        label) cmd_label "$@" ;;
+        --prune) cmd_prune "$@" ;;
         version|--version|-V)
             printf '%s %s\n' "$PROGRAM" "$VERSION"
             ;;
@@ -974,3 +1317,4 @@ main() {
 }
 
 main "$@"
+
