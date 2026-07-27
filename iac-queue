@@ -1,0 +1,976 @@
+#!/usr/bin/env bash
+#
+# iac-queue - a small, provider-neutral, directory-backed task queue.
+#
+# The caller supplies an opaque key and external ID. iac-queue assigns its own
+# internal queue ID and never interprets the external ID or message.
+#
+
+set -euo pipefail
+
+PROGRAM="iac-queue"
+VERSION="0.4.0"
+MAX_MESSAGES="${IAC_QUEUE_MAX_MESSAGES:-10}"
+MAX_MESSAGE_BYTES="${IAC_QUEUE_MAX_MESSAGE_BYTES:-8192}"
+
+SELF_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+SELF_DIR="$(dirname "$SELF_PATH")"
+
+if [[ -n "${IAC_QUEUE_ROOT:-}" ]]; then
+    ROOT="$(readlink -f "$IAC_QUEUE_ROOT")"
+elif [[ "$(basename "$SELF_DIR")" == "bin" ]]; then
+    ROOT="$(dirname "$SELF_DIR")"
+else
+    ROOT="$SELF_DIR"
+fi
+
+QUEUE_ROOT="$ROOT/queue"
+BACKLOG_DIR="$QUEUE_ROOT/backlog"
+INPROGRESS_DIR="$QUEUE_ROOT/inprogress"
+COMPLETED_DIR="$QUEUE_ROOT/completed"
+LOG_DIR="$ROOT/logs"
+LOG_FILE="$LOG_DIR/iac-queue.log"
+LOCK_FILE="$LOG_DIR/iac-queue.lock"
+LOCK_DIR="$LOG_DIR/iac-queue.lock.d"
+NEXT_ID_FILE="$QUEUE_ROOT/next_id"
+LOCK_METHOD=""
+TEMP_PAYLOAD_FILE=""
+TEMP_RECORD_DIR=""
+TEMP_MESSAGE_DIR=""
+
+usage() {
+    cat <<'EOF'
+Usage:
+  iac-queue install TARGET
+  iac-queue add KEY EXTERNAL_ID [MESSAGE...]
+  iac-queue add KEY EXTERNAL_ID --file FILE
+  iac-queue add KEY EXTERNAL_ID --stdin
+  iac-queue cancel KEY EXTERNAL_ID [NOTE...]
+  iac-queue start KEY EXTERNAL_ID [NOTE...]
+  iac-queue complete KEY EXTERNAL_ID [NOTE...]
+  iac-queue push KEY EXTERNAL_ID MESSAGE...
+  iac-queue push KEY EXTERNAL_ID --file FILE
+  iac-queue push KEY EXTERNAL_ID --stdin
+  iac-queue peek KEY EXTERNAL_ID
+  iac-queue shift KEY EXTERNAL_ID
+  iac-queue backlog KEY [--long]
+  iac-queue inprogress KEY [--long]
+  iac-queue completed KEY [--long]
+  iac-queue show KEY EXTERNAL_ID
+  iac-queue version
+
+Install:
+  TARGET is the parent directory. The installation is created at:
+
+      TARGET/iac-queue/
+
+  If the installation is inside a Git worktree, only these runtime paths
+  are added to that repository's .gitignore:
+
+      iac-queue/bin/
+      iac-queue/logs/
+
+  Queue records are not ignored and may be tracked by Git.
+
+Queue behavior:
+  add       Add a new task to backlog. Existing external IDs are ignored.
+  cancel    Move backlog/in-progress task to completed as cancelled.
+  start     Move a backlog task to inprogress.
+  complete  Move an in-progress task to completed as successful.
+  push      Append an ASCII message to a task's message queue.
+  peek      Read the oldest message without removing it.
+  shift     Read and remove the oldest message.
+
+Listings are FIFO. Without --long, listings print one external ID per line.
+
+Every task belongs to one caller-defined key. The key is mandatory for every
+task operation and listing. There is no unfiltered listing command.
+
+Keys are logical namespaces and filters, not authentication credentials.
+
+The caller chooses an arbitrary, single-line external ID. iac-queue assigns
+its own internal queue ID. External-ID uniqueness is scoped to the key.
+
+The optional MESSAGE supplied to add becomes the first queued message.
+Messages are ASCII plaintext and are not interpreted by iac-queue. Providers
+must encrypt and ASCII-encode sensitive payloads before adding them.
+
+Defaults per task:
+  Maximum messages:       10
+  Maximum message bytes:  8192
+
+Completed and cancelled tasks have their message payload files removed from
+the queue record.
+EOF
+}
+
+die() {
+    printf '%s: ERROR: %s\n' "$PROGRAM" "$*" >&2
+    exit 1
+}
+
+now_iso() {
+    date -u '+%Y-%m-%dT%H:%M:%SZ'
+}
+
+actor_name() {
+    if [[ -n "${IAC_QUEUE_ACTOR:-}" ]]; then
+        printf '%s\n' "$IAC_QUEUE_ACTOR"
+    else
+        id -un
+    fi
+}
+
+sanitize_note() {
+    printf '%s' "$*" | tr '\t\r\n' '   '
+}
+
+ensure_runtime() {
+    [[ "$MAX_MESSAGES" =~ ^[1-9][0-9]*$ ]] || {
+        die "IAC_QUEUE_MAX_MESSAGES must be a positive integer"
+    }
+    [[ "$MAX_MESSAGE_BYTES" =~ ^[1-9][0-9]*$ ]] || {
+        die "IAC_QUEUE_MAX_MESSAGE_BYTES must be a positive integer"
+    }
+
+    umask 0027
+    mkdir -p \
+        "$BACKLOG_DIR" \
+        "$INPROGRESS_DIR" \
+        "$COMPLETED_DIR" \
+        "$LOG_DIR"
+}
+
+acquire_lock() {
+    local attempt
+
+    if command -v flock >/dev/null 2>&1; then
+        exec 9>"$LOCK_FILE"
+        flock -x 9
+        LOCK_METHOD="flock"
+        return 0
+    fi
+
+    for attempt in $(seq 1 200); do
+        if mkdir "$LOCK_DIR" 2>/dev/null; then
+            printf '%s\n' "$$" > "$LOCK_DIR/pid"
+            LOCK_METHOD="directory"
+            return 0
+        fi
+        sleep 0.05
+    done
+
+    die "timed out waiting for queue lock"
+}
+
+release_lock() {
+    if [[ "$LOCK_METHOD" == "directory" ]]; then
+        rm -f -- "$LOCK_DIR/pid"
+        rmdir -- "$LOCK_DIR" 2>/dev/null || true
+        LOCK_METHOD=""
+    fi
+}
+
+cleanup_on_exit() {
+    if [[ -n "$TEMP_PAYLOAD_FILE" && -f "$TEMP_PAYLOAD_FILE" ]]; then
+        rm -f -- "$TEMP_PAYLOAD_FILE"
+    fi
+
+    if [[ -n "$TEMP_MESSAGE_DIR" && -d "$TEMP_MESSAGE_DIR" ]]; then
+        find "$TEMP_MESSAGE_DIR" -depth -delete
+    fi
+
+    if [[ -n "$TEMP_RECORD_DIR" && -d "$TEMP_RECORD_DIR" ]]; then
+        find "$TEMP_RECORD_DIR" -depth -delete
+    fi
+
+    release_lock
+}
+
+trap cleanup_on_exit EXIT
+
+validate_external_id() {
+    local external_id="$1"
+
+    [[ -n "$external_id" ]] || die "external ID cannot be empty"
+
+    if [[ "$external_id" == *$'\n'* ||
+          "$external_id" == *$'\r'* ||
+          "$external_id" == *$'\t'* ]]; then
+        die "external ID must be a single line without tabs"
+    fi
+}
+
+validate_key() {
+    local key="$1"
+
+    [[ -n "$key" ]] || die "key cannot be empty"
+
+    if [[ "$key" == *$'\n'* ||
+          "$key" == *$'\r'* ||
+          "$key" == *$'\t'* ]]; then
+        die "key must be a single line without tabs"
+    fi
+}
+
+append_history() {
+    local item_path="$1"
+    local action="$2"
+    local note="${3:-}"
+
+    printf '%s\t%s\t%s\t%s\n' \
+        "$(now_iso)" \
+        "$action" \
+        "$(actor_name)" \
+        "$(sanitize_note "$note")" \
+        >> "$item_path/history.log"
+}
+
+write_log() {
+    local action="$1"
+    local key="$2"
+    local external_id="$3"
+    local detail="${4:-}"
+
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$(now_iso)" \
+        "$action" \
+        "$key" \
+        "$external_id" \
+        "$(actor_name)" \
+        "$(sanitize_note "$detail")" \
+        >> "$LOG_FILE"
+}
+
+allocate_queue_id() {
+    local next_number="1"
+    local new_next
+    local temp_counter
+
+    if [[ -f "$NEXT_ID_FILE" ]]; then
+        IFS= read -r next_number < "$NEXT_ID_FILE" || true
+    fi
+
+    [[ "$next_number" =~ ^[0-9]+$ ]] || {
+        die "invalid internal queue counter: $NEXT_ID_FILE"
+    }
+
+    QUEUE_NUMBER="$next_number"
+    QUEUE_ID="$(printf 'Q%09d' "$((10#$next_number))")"
+    new_next="$((10#$next_number + 1))"
+    temp_counter="$NEXT_ID_FILE.tmp.$$"
+    printf '%s\n' "$new_next" > "$temp_counter"
+    mv -- "$temp_counter" "$NEXT_ID_FILE"
+}
+
+find_item() {
+    local key="$1"
+    local external_id="$2"
+    local state
+    local state_dir
+    local candidate
+    local candidate_external_id
+    local candidate_key
+
+    ITEM_STATE=""
+    ITEM_PATH=""
+    ITEM_QUEUE_ID=""
+
+    for state in backlog inprogress completed; do
+        case "$state" in
+            backlog) state_dir="$BACKLOG_DIR" ;;
+            inprogress) state_dir="$INPROGRESS_DIR" ;;
+            completed) state_dir="$COMPLETED_DIR" ;;
+        esac
+
+        shopt -s nullglob
+        for candidate in "$state_dir"/*; do
+            [[ -d "$candidate" ]] || continue
+            [[ -f "$candidate/key" ]] || continue
+            [[ -f "$candidate/external_id" ]] || continue
+            IFS= read -r candidate_key < "$candidate/key" || true
+            IFS= read -r candidate_external_id < "$candidate/external_id" || true
+
+            if [[ "$candidate_key" == "$key" &&
+                  "$candidate_external_id" == "$external_id" ]]; then
+                ITEM_STATE="$state"
+                ITEM_PATH="$candidate"
+                ITEM_QUEUE_ID="$(basename "$candidate")"
+                shopt -u nullglob
+                return 0
+            fi
+        done
+        shopt -u nullglob
+    done
+
+    return 1
+}
+
+validate_payload_file() {
+    local payload_file="$1"
+    local byte_count
+    local invalid_count
+
+    [[ -s "$payload_file" ]] || die "message payload cannot be empty"
+
+    byte_count="$(wc -c < "$payload_file" | tr -d '[:space:]')"
+    (( byte_count <= MAX_MESSAGE_BYTES )) || {
+        die "message exceeds maximum size of $MAX_MESSAGE_BYTES bytes"
+    }
+
+    invalid_count="$(
+        LC_ALL=C tr -d '\11\12\15\40-\176' < "$payload_file" |
+            wc -c |
+            tr -d '[:space:]'
+    )"
+
+    [[ "$invalid_count" == "0" ]] || {
+        die "message must contain only ASCII plaintext"
+    }
+}
+
+capture_payload() {
+    local destination="$1"
+    shift
+
+    PAYLOAD_PRESENT="false"
+    : > "$destination"
+
+    if [[ $# -eq 0 ]]; then
+        return 0
+    fi
+
+    case "$1" in
+        --file)
+            [[ $# -eq 2 ]] || {
+                die "message --file requires exactly one FILE"
+            }
+            [[ -f "$2" ]] || die "message file not found: $2"
+            cp -- "$2" "$destination"
+            ;;
+        --stdin)
+            [[ $# -eq 1 ]] || {
+                die "message --stdin does not accept other arguments"
+            }
+            cat > "$destination"
+            ;;
+        *)
+            printf '%s\n' "$*" > "$destination"
+            ;;
+    esac
+
+    validate_payload_file "$destination"
+    PAYLOAD_PRESENT="true"
+}
+
+message_count() {
+    local item_path="$1"
+    local message_path
+    local count=0
+
+    shopt -s nullglob
+    for message_path in "$item_path/messages"/M*; do
+        [[ -d "$message_path" ]] || continue
+        count=$((count + 1))
+    done
+    shopt -u nullglob
+
+    printf '%s\n' "$count"
+}
+
+allocate_message_id() {
+    local item_path="$1"
+    local counter_file="$item_path/next_message_id"
+    local next_number="1"
+    local next_value
+    local temp_counter
+
+    if [[ -f "$counter_file" ]]; then
+        IFS= read -r next_number < "$counter_file" || true
+    fi
+
+    [[ "$next_number" =~ ^[0-9]+$ ]] || {
+        die "invalid message counter for queue record $ITEM_QUEUE_ID"
+    }
+
+    MESSAGE_ID="$(printf 'M%09d' "$((10#$next_number))")"
+    next_value="$((10#$next_number + 1))"
+    temp_counter="$counter_file.tmp.$$"
+    printf '%s\n' "$next_value" > "$temp_counter"
+    mv -- "$temp_counter" "$counter_file"
+}
+
+enqueue_payload() {
+    local item_path="$1"
+    local payload_file="$2"
+    local current_count
+    local temp_message
+    local final_message
+
+    validate_payload_file "$payload_file"
+    mkdir -p "$item_path/messages"
+    current_count="$(message_count "$item_path")"
+
+    (( current_count < MAX_MESSAGES )) || {
+        die "message queue is full; maximum is $MAX_MESSAGES messages"
+    }
+
+    allocate_message_id "$item_path"
+    temp_message="$(mktemp -d "$item_path/messages/.tmp.XXXXXX")"
+    TEMP_MESSAGE_DIR="$temp_message"
+    printf '%s\n' "$(now_iso)" > "$temp_message/created_at"
+    printf '%s\n' "$(actor_name)" > "$temp_message/actor"
+    cp -- "$payload_file" "$temp_message/payload.txt"
+    final_message="$item_path/messages/$MESSAGE_ID"
+    mv -- "$temp_message" "$final_message"
+    TEMP_MESSAGE_DIR=""
+}
+
+find_oldest_message() {
+    local item_path="$1"
+    local message_path
+
+    OLDEST_MESSAGE_PATH=""
+    OLDEST_MESSAGE_ID=""
+
+    shopt -s nullglob
+    for message_path in "$item_path/messages"/M*; do
+        [[ -d "$message_path" ]] || continue
+        OLDEST_MESSAGE_PATH="$message_path"
+        OLDEST_MESSAGE_ID="$(basename "$message_path")"
+        break
+    done
+    shopt -u nullglob
+
+    [[ -n "$OLDEST_MESSAGE_PATH" ]]
+}
+
+flush_messages() {
+    local item_path="$1"
+    local message_path
+    local count=0
+
+    shopt -s nullglob
+    for message_path in "$item_path/messages"/M*; do
+        [[ -d "$message_path" ]] || continue
+        find "$message_path" -type f -delete
+        rmdir -- "$message_path"
+        count=$((count + 1))
+    done
+    shopt -u nullglob
+
+    FLUSHED_MESSAGES="$count"
+}
+
+append_gitignore_entry() {
+    local gitignore_file="$1"
+    local entry="$2"
+
+    if [[ -f "$gitignore_file" ]] && grep -Fqx -- "$entry" "$gitignore_file"; then
+        return 0
+    fi
+
+    if [[ -s "$gitignore_file" ]]; then
+        printf '\n' >> "$gitignore_file"
+    fi
+
+    printf '%s\n' "$entry" >> "$gitignore_file"
+}
+
+cmd_install() {
+    [[ $# -eq 1 ]] || die "install requires one TARGET directory"
+
+    local target
+    local install_root
+    local destination
+    local git_root
+    local relative_bin
+    local relative_logs
+    local gitignore_file
+
+    mkdir -p -- "$1"
+    target="$(readlink -f "$1")"
+    install_root="$target/iac-queue"
+    destination="$install_root/bin/iac-queue"
+
+    umask 0027
+    mkdir -p \
+        "$install_root/bin" \
+        "$install_root/logs" \
+        "$install_root/queue/backlog" \
+        "$install_root/queue/inprogress" \
+        "$install_root/queue/completed"
+
+    touch \
+        "$install_root/queue/backlog/.gitkeep" \
+        "$install_root/queue/inprogress/.gitkeep" \
+        "$install_root/queue/completed/.gitkeep"
+
+    if [[ ! -e "$destination" ||
+          "$SELF_PATH" != "$(readlink -f "$destination")" ]]; then
+        install -m 0755 "$SELF_PATH" "$destination"
+    else
+        chmod 0755 "$destination"
+    fi
+
+    if git_root="$(git -C "$install_root" rev-parse --show-toplevel 2>/dev/null)"; then
+        git_root="$(readlink -f "$git_root")"
+        gitignore_file="$git_root/.gitignore"
+        relative_bin="${install_root#"$git_root"/}/bin"
+        relative_logs="${install_root#"$git_root"/}/logs"
+
+        append_gitignore_entry "$gitignore_file" "/$relative_bin/"
+        append_gitignore_entry "$gitignore_file" "/$relative_logs/"
+
+        printf 'Updated Git ignore file: %s\n' "$gitignore_file"
+        printf 'Queue data remains visible to Git: %s\n' "$install_root/queue"
+    else
+        printf 'Target is not inside a Git worktree; no .gitignore was changed.\n'
+    fi
+
+    printf 'Installed %s at: %s\n' "$PROGRAM" "$destination"
+    printf 'Queue directory: %s\n' "$install_root/queue"
+}
+
+cmd_add() {
+    [[ $# -ge 2 ]] || die "add requires a key and external ID"
+
+    local key="$1"
+    local external_id="$2"
+    shift 2
+
+    local temp_path
+    local created_at
+    local initial_payload
+
+    validate_key "$key"
+    validate_external_id "$external_id"
+
+    ensure_runtime
+    acquire_lock
+
+    if find_item "$key" "$external_id"; then
+        printf '%s already exists as %s in %s; add ignored.\n' \
+            "$external_id" "$ITEM_QUEUE_ID" "$ITEM_STATE"
+        write_log "add-ignored" "$key" "$external_id" \
+            "$ITEM_QUEUE_ID already in $ITEM_STATE"
+        return 0
+    fi
+
+    allocate_queue_id
+    temp_path="$(mktemp -d "$BACKLOG_DIR/.${QUEUE_ID}.tmp.XXXXXX")"
+    TEMP_RECORD_DIR="$temp_path"
+    created_at="$(now_iso)"
+
+    printf '%s\n' "$key" > "$temp_path/key"
+    printf '%s\n' "$external_id" > "$temp_path/external_id"
+    printf '%s\n' "$created_at" > "$temp_path/created_at"
+    printf '%s\n' "$QUEUE_NUMBER" > "$temp_path/created_order"
+    printf '%s\n' "$created_at" > "$temp_path/updated_at"
+    : > "$temp_path/result"
+    : > "$temp_path/history.log"
+    mkdir -p "$temp_path/messages"
+
+    append_history "$temp_path" "added" ""
+
+    initial_payload="$temp_path/.initial-payload"
+    TEMP_PAYLOAD_FILE="$initial_payload"
+    capture_payload "$initial_payload" "$@"
+    if [[ "$PAYLOAD_PRESENT" == "true" ]]; then
+        enqueue_payload "$temp_path" "$initial_payload"
+        append_history "$temp_path" "message-pushed" "$MESSAGE_ID"
+    fi
+    rm -f -- "$initial_payload"
+    TEMP_PAYLOAD_FILE=""
+
+    mv -- "$temp_path" "$BACKLOG_DIR/$QUEUE_ID"
+    TEMP_RECORD_DIR=""
+
+    write_log "added" "$key" "$external_id" "$QUEUE_ID backlog"
+    printf '%s added to key %s backlog as %s.\n' \
+        "$external_id" "$key" "$QUEUE_ID"
+}
+
+cmd_cancel() {
+    [[ $# -ge 2 ]] || die "cancel requires a key and external ID"
+
+    local key="$1"
+    local external_id="$2"
+    shift 2
+    local note="$*"
+    local destination
+
+    validate_key "$key"
+    validate_external_id "$external_id"
+    ensure_runtime
+    acquire_lock
+
+    if ! find_item "$key" "$external_id"; then
+        printf '%s does not exist; cancel ignored.\n' "$external_id"
+        write_log "cancel-ignored" "$key" "$external_id" "not found"
+        return 0
+    fi
+
+    if [[ "$ITEM_STATE" == "completed" ]]; then
+        printf '%s is already completed; cancel ignored.\n' "$external_id"
+        write_log "cancel-ignored" "$key" "$external_id" \
+            "$ITEM_QUEUE_ID already completed"
+        return 0
+    fi
+
+    flush_messages "$ITEM_PATH"
+    if (( FLUSHED_MESSAGES > 0 )); then
+        append_history "$ITEM_PATH" "messages-flushed" \
+            "$FLUSHED_MESSAGES message(s)"
+    fi
+
+    destination="$COMPLETED_DIR/$ITEM_QUEUE_ID"
+    mv -- "$ITEM_PATH" "$destination"
+    printf '%s\n' "cancelled" > "$destination/result"
+    printf '%s\n' "$(now_iso)" > "$destination/updated_at"
+    append_history "$destination" "cancelled" "$note"
+
+    write_log "cancelled" "$key" "$external_id" "$ITEM_QUEUE_ID $note"
+    printf '%s (%s) moved to completed as cancelled.\n' \
+        "$external_id" "$ITEM_QUEUE_ID"
+}
+
+cmd_start() {
+    [[ $# -ge 2 ]] || die "start requires a key and external ID"
+
+    local key="$1"
+    local external_id="$2"
+    shift 2
+    local note="$*"
+    local destination
+
+    validate_key "$key"
+    validate_external_id "$external_id"
+    ensure_runtime
+    acquire_lock
+
+    find_item "$key" "$external_id" || {
+        die "task '$external_id' does not exist for key '$key'"
+    }
+
+    case "$ITEM_STATE" in
+        backlog)
+            destination="$INPROGRESS_DIR/$ITEM_QUEUE_ID"
+            mv -- "$ITEM_PATH" "$destination"
+            printf '%s\n' "$(now_iso)" > "$destination/updated_at"
+            append_history "$destination" "started" "$note"
+            write_log "started" "$key" "$external_id" "$ITEM_QUEUE_ID $note"
+            printf '%s (%s) moved to inprogress.\n' \
+                "$external_id" "$ITEM_QUEUE_ID"
+            ;;
+        inprogress)
+            printf '%s is already inprogress; start ignored.\n' "$external_id"
+            write_log "start-ignored" "$key" "$external_id" \
+                "$ITEM_QUEUE_ID already inprogress"
+            ;;
+        completed)
+            printf '%s is already completed; start ignored.\n' "$external_id"
+            write_log "start-ignored" "$key" "$external_id" \
+                "$ITEM_QUEUE_ID already completed"
+            ;;
+    esac
+}
+
+cmd_complete() {
+    [[ $# -ge 2 ]] || die "complete requires a key and external ID"
+
+    local key="$1"
+    local external_id="$2"
+    shift 2
+    local note="$*"
+    local destination
+    local existing_result
+
+    validate_key "$key"
+    validate_external_id "$external_id"
+    ensure_runtime
+    acquire_lock
+
+    find_item "$key" "$external_id" || {
+        die "task '$external_id' does not exist for key '$key'"
+    }
+
+    if [[ "$ITEM_STATE" == "completed" ]]; then
+        existing_result="$(cat "$ITEM_PATH/result" 2>/dev/null || true)"
+        printf '%s is already completed (%s); complete ignored.\n' \
+            "$external_id" "${existing_result:-unknown}"
+        write_log "complete-ignored" "$key" "$external_id" \
+            "$ITEM_QUEUE_ID already completed"
+        return 0
+    fi
+
+    [[ "$ITEM_STATE" == "inprogress" ]] || {
+        die "task '$external_id' is in backlog; run start before complete"
+    }
+
+    flush_messages "$ITEM_PATH"
+    if (( FLUSHED_MESSAGES > 0 )); then
+        append_history "$ITEM_PATH" "messages-flushed" \
+            "$FLUSHED_MESSAGES message(s)"
+    fi
+
+    destination="$COMPLETED_DIR/$ITEM_QUEUE_ID"
+    mv -- "$ITEM_PATH" "$destination"
+    printf '%s\n' "success" > "$destination/result"
+    printf '%s\n' "$(now_iso)" > "$destination/updated_at"
+    append_history "$destination" "completed" "$note"
+
+    write_log "completed" "$key" "$external_id" "$ITEM_QUEUE_ID $note"
+    printf '%s (%s) moved to completed as successful.\n' \
+        "$external_id" "$ITEM_QUEUE_ID"
+}
+
+require_open_task() {
+    local key="$1"
+    local external_id="$2"
+
+    find_item "$key" "$external_id" || {
+        die "task '$external_id' does not exist for key '$key'"
+    }
+
+    [[ "$ITEM_STATE" != "completed" ]] || {
+        die "task '$external_id' is completed; its message queue is closed"
+    }
+}
+
+cmd_push() {
+    [[ $# -ge 3 ]] || {
+        die "push requires a key, external ID, and message"
+    }
+
+    local key="$1"
+    local external_id="$2"
+    shift 2
+    local payload_file
+
+    validate_key "$key"
+    validate_external_id "$external_id"
+    ensure_runtime
+    acquire_lock
+    require_open_task "$key" "$external_id"
+
+    payload_file="$ITEM_PATH/.incoming-message.$$"
+    TEMP_PAYLOAD_FILE="$payload_file"
+    capture_payload "$payload_file" "$@"
+    [[ "$PAYLOAD_PRESENT" == "true" ]] || die "push requires a message"
+
+    enqueue_payload "$ITEM_PATH" "$payload_file"
+    rm -f -- "$payload_file"
+    TEMP_PAYLOAD_FILE=""
+    printf '%s\n' "$(now_iso)" > "$ITEM_PATH/updated_at"
+    append_history "$ITEM_PATH" "message-pushed" "$MESSAGE_ID"
+    write_log "message-pushed" "$key" "$external_id" \
+        "$ITEM_QUEUE_ID $MESSAGE_ID"
+
+    printf '%s pushed to %s (%s).\n' \
+        "$MESSAGE_ID" "$external_id" "$ITEM_QUEUE_ID"
+}
+
+cmd_peek() {
+    [[ $# -eq 2 ]] || die "peek requires a key and external ID"
+
+    local key="$1"
+    local external_id="$2"
+
+    validate_key "$key"
+    validate_external_id "$external_id"
+    ensure_runtime
+    acquire_lock
+    require_open_task "$key" "$external_id"
+
+    if ! find_oldest_message "$ITEM_PATH"; then
+        printf '%s: message queue is empty for task %s\n' \
+            "$PROGRAM" "$external_id" >&2
+        return 2
+    fi
+
+    cat "$OLDEST_MESSAGE_PATH/payload.txt"
+}
+
+cmd_shift() {
+    [[ $# -eq 2 ]] || die "shift requires a key and external ID"
+
+    local key="$1"
+    local external_id="$2"
+
+    validate_key "$key"
+    validate_external_id "$external_id"
+    ensure_runtime
+    acquire_lock
+    require_open_task "$key" "$external_id"
+
+    if ! find_oldest_message "$ITEM_PATH"; then
+        printf '%s: message queue is empty for task %s\n' \
+            "$PROGRAM" "$external_id" >&2
+        return 2
+    fi
+
+    cat "$OLDEST_MESSAGE_PATH/payload.txt"
+    find "$OLDEST_MESSAGE_PATH" -type f -delete
+    rmdir -- "$OLDEST_MESSAGE_PATH"
+    printf '%s\n' "$(now_iso)" > "$ITEM_PATH/updated_at"
+    append_history "$ITEM_PATH" "message-shifted" "$OLDEST_MESSAGE_ID"
+    write_log "message-shifted" "$key" "$external_id" \
+        "$ITEM_QUEUE_ID $OLDEST_MESSAGE_ID"
+}
+
+list_state() {
+    local state="$1"
+    shift
+
+    [[ $# -ge 1 ]] || die "$state requires a key"
+
+    local key="$1"
+    shift
+    local long_output="false"
+    local state_dir
+    local item_path
+    local queue_id
+    local external_id
+    local item_key
+    local order
+    local created
+    local result
+    local messages
+    local rows=()
+
+    validate_key "$key"
+
+    if [[ $# -gt 0 ]]; then
+        [[ $# -eq 1 && "$1" == "--long" ]] || {
+            die "only --long is supported for queue listings"
+        }
+        long_output="true"
+    fi
+
+    case "$state" in
+        backlog) state_dir="$BACKLOG_DIR" ;;
+        inprogress) state_dir="$INPROGRESS_DIR" ;;
+        completed) state_dir="$COMPLETED_DIR" ;;
+        *) die "unknown queue state: $state" ;;
+    esac
+
+    ensure_runtime
+    acquire_lock
+
+    shopt -s nullglob
+    for item_path in "$state_dir"/*; do
+        [[ -d "$item_path" ]] || continue
+        queue_id="$(basename "$item_path")"
+        [[ -f "$item_path/key" ]] || continue
+        [[ -f "$item_path/external_id" ]] || continue
+        item_key="$(cat "$item_path/key")"
+        [[ "$item_key" == "$key" ]] || continue
+        order="$(cat "$item_path/created_order" 2>/dev/null || printf '0')"
+        rows+=("$order"$'\t'"$queue_id")
+    done
+    shopt -u nullglob
+
+    if [[ "$long_output" == "true" ]]; then
+        printf 'QUEUE_ID\tKEY\tEXTERNAL_ID\tSTATE\tCREATED\tRESULT\tMESSAGES\n'
+    fi
+
+    if [[ ${#rows[@]} -eq 0 ]]; then
+        return 0
+    fi
+
+    while IFS=$'\t' read -r order queue_id; do
+        item_path="$state_dir/$queue_id"
+        external_id="$(cat "$item_path/external_id")"
+
+        if [[ "$long_output" == "true" ]]; then
+            created="$(cat "$item_path/created_at" 2>/dev/null || true)"
+            result="$(cat "$item_path/result" 2>/dev/null || true)"
+            messages="$(message_count "$item_path")"
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$queue_id" \
+                "$key" \
+                "$external_id" \
+                "$state" \
+                "$created" \
+                "${result:--}" \
+                "$messages"
+        else
+            printf '%s\n' "$external_id"
+        fi
+    done < <(printf '%s\n' "${rows[@]}" | LC_ALL=C sort -k1,1n -k2,2)
+}
+
+cmd_show() {
+    [[ $# -eq 2 ]] || die "show requires a key and external ID"
+
+    local key="$1"
+    local external_id="$2"
+    local created
+    local updated
+    local result
+    local messages
+
+    validate_key "$key"
+    validate_external_id "$external_id"
+
+    ensure_runtime
+    acquire_lock
+    find_item "$key" "$external_id" || {
+        die "task '$external_id' does not exist for key '$key'"
+    }
+
+    created="$(cat "$ITEM_PATH/created_at" 2>/dev/null || true)"
+    updated="$(cat "$ITEM_PATH/updated_at" 2>/dev/null || true)"
+    result="$(cat "$ITEM_PATH/result" 2>/dev/null || true)"
+    messages="$(message_count "$ITEM_PATH")"
+
+    printf 'Queue ID: %s\n' "$ITEM_QUEUE_ID"
+    printf 'Key: %s\n' "$key"
+    printf 'External ID: %s\n' "$external_id"
+    printf 'State: %s\n' "$ITEM_STATE"
+    printf 'Result: %s\n' "${result:--}"
+    printf 'Created: %s\n' "$created"
+    printf 'Updated: %s\n' "$updated"
+    printf 'Messages: %s\n' "$messages"
+    printf '\nHistory:\n'
+    cat "$ITEM_PATH/history.log"
+}
+
+main() {
+    local command="${1:-}"
+
+    if [[ -z "$command" ]]; then
+        usage
+        exit 1
+    fi
+
+    shift
+
+    case "$command" in
+        install) cmd_install "$@" ;;
+        add) cmd_add "$@" ;;
+        cancel) cmd_cancel "$@" ;;
+        start) cmd_start "$@" ;;
+        complete) cmd_complete "$@" ;;
+        push) cmd_push "$@" ;;
+        peek) cmd_peek "$@" ;;
+        shift) cmd_shift "$@" ;;
+        backlog) list_state "backlog" "$@" ;;
+        inprogress) list_state "inprogress" "$@" ;;
+        completed) list_state "completed" "$@" ;;
+        show) cmd_show "$@" ;;
+        version|--version|-V)
+            printf '%s %s\n' "$PROGRAM" "$VERSION"
+            ;;
+        help|--help|-h)
+            usage
+            ;;
+        *)
+            usage >&2
+            die "unknown command '$command'"
+            ;;
+    esac
+}
+
+main "$@"
