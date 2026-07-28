@@ -22,7 +22,7 @@ VMware, or other providers. Those systems are clients of the queue.
 * Consumers: these processes/users reads (or consumes)  queue record data data.
 
 For example:  Jenkins --> iac-queue --> Ansible  
-              Producer                  Consumer  
+Jenkins is the producer, while Ansible is the consumer.
 
 ## Keys
 
