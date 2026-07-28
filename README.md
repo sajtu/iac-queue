@@ -1,11 +1,13 @@
 # iac-queue
 `iac-queue` is a small, provider-neutral, directory-backed task queue originally developed for IaC pipelines and workflows.
 
+It stores and moves tasks (also known as queue records) through:
+
 ```text
 backlog -> inprogress -> completed
 ```
 
-Cancelled backlog or in-progress tasks move to `completed` with the result
+Cancelled backlog or in-progress tasks (or queue records) move to `completed` with the result
 `cancelled`.
 
 Abandoned backlog or in-progress tasks that reach the maximum age move to the
@@ -13,6 +15,14 @@ read-only `abort` queue with the result `aborted`.
 
 The program knows nothing about Jenkins, Terraform, Ansible, Puppet, Proxmox,
 VMware, or other providers. Those systems are clients of the queue.
+
+## Terms:
+
+* Producers: these processes/users provide (or produces) queue record(s) (AKA task(s)) and queue record data to the iac-queue.
+* Consumers: these processes/users reads (or consumes)  queue record data data.
+
+For example:  Jenkins --> iac-queue --> Ansible  
+              Producer                  Consumer  
 
 ## Keys
 
@@ -61,6 +71,8 @@ numbers, periods (`.`), underscores (`_`), plus signs (`+`), and hyphens
 External-ID uniqueness is scoped to a key. Therefore, two different keys may
 both contain external ID `118`.
 
+**DO NOT FORGET OR LOSE YOUR KEY(S)!!!* You will not be able to manage, list, or show anything from you queue without your keys. There is no recovery system if you lost or forget your key(s)!
+
 ## Install
 
 Run the installer as the account that will operate the queue:
@@ -88,12 +100,42 @@ With the `/opt/iac` installed path example, this creates:
     ├── inprogress/
     ├── completed/
     ├── abort/
+    ├── trash/
     └── namespaces/
 ```
 
 If the installation is inside a Git worktree, the installer adds only
-`iac-queue/bin/` and `iac-queue/logs/` to `.gitignore`. Queue records remain
-visible to Git.
+`iac-queue/bin/`, `iac-queue/logs/`, and `iac-queue/queue/trash/` to
+`.gitignore`. Active, completed, and aborted queue records remain visible to
+Git. Records moved to trash are not tracked.
+
+For multiple operating-system users, place those users in the same group and
+make the installation owned by that group. Runtime directories use set-group-ID
+and group-write permissions so new queue files inherit the shared group.
+
+## Concurrent access
+
+`iac-queue` supports multiple concurrent processes:
+
+* Reads of the same record use shared locks and may run concurrently.
+* Queue listings do not take a queue-wide write lock.
+* Changes to the same key and external ID are serialized with a record lock.
+* Changes to different records may run concurrently.
+* Internal queue-ID allocation uses a separate, short-lived counter lock.
+* Expiration, cleanup, and trash purging use a maintenance lock.
+
+On Linux, locks use `flock`. A portable exclusive lock-directory fallback is
+used when `flock` is unavailable; on that fallback, same-record reads are
+serialized. Lock files are runtime data under `logs/` and are not tracked by
+Git.
+
+After upgrading an existing installation, run the installer again so existing
+runtime and queue paths receive the shared-group permissions and the trash
+ignore rule:
+
+```bash
+sudo -u <username> ./iac-queue install /path/to/install/dir
+```
 
 ## Usage Example: Add new queue record:
 
@@ -227,6 +269,34 @@ An active queue record that is 366 days old is automatically:
 
 Records in `completed` or `abort` are terminal and are not automatically moved
 again.
+
+## Optional terminal record cleanup
+
+Completed and aborted records are retained forever unless cleanup is
+explicitly requested.
+
+Move terminal records that have been completed or aborted for at least 365
+days into the untracked `trash` directory:
+
+```bash
+iac-queue cleanup 365
+```
+
+`DAYS` is required and may be zero or a positive integer. Using zero moves all
+completed and aborted records to trash.
+
+Records in trash are excluded from queue listings, task lookup, expiration
+checks, and normal queue operations. Moving tracked records to trash appears
+to Git as deletion of those records.
+
+Permanently delete every record currently in trash:
+
+```bash
+iac-queue purge-trash --yes
+```
+
+`purge-trash` requires `--yes` because deletion is permanent. If `cleanup` and
+`purge-trash` are never run, terminal records continue to be retained.
 
 ## Message queue subsystem
 

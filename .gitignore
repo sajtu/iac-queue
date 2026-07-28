@@ -1,3 +1,5 @@
 *.backup
 *.backup*
 iac-queue.*
+logs/
+queue/

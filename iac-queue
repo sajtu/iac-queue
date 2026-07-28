@@ -10,7 +10,7 @@
 set -euo pipefail
 
 PROGRAM="iac-queue"
-VERSION="0.6.0"
+VERSION="0.9.1"
 MAX_MESSAGES="${IAC_QUEUE_MAX_MESSAGES:-10}"
 MAX_MESSAGE_BYTES="${IAC_QUEUE_MAX_MESSAGE_BYTES:-8192}"
 AUTO_ABORT_DAYS=366
@@ -32,13 +32,21 @@ BACKLOG_DIR="$QUEUE_ROOT/backlog"
 INPROGRESS_DIR="$QUEUE_ROOT/inprogress"
 COMPLETED_DIR="$QUEUE_ROOT/completed"
 ABORT_DIR="$QUEUE_ROOT/abort"
+TRASH_DIR="$QUEUE_ROOT/trash"
 LOG_DIR="$ROOT/logs"
 LOG_FILE="$LOG_DIR/iac-queue.log"
-LOCK_FILE="$LOG_DIR/iac-queue.lock"
-LOCK_DIR="$LOG_DIR/iac-queue.lock.d"
+LOCK_ROOT="$LOG_DIR/locks"
+RECORD_LOCK_ROOT="$LOCK_ROOT/records"
+COUNTER_LOCK_FILE="$LOCK_ROOT/counter.lock"
+COUNTER_LOCK_DIR="$LOCK_ROOT/counter.lock.d"
+MAINTENANCE_LOCK_FILE="$LOCK_ROOT/maintenance.lock"
+MAINTENANCE_LOCK_DIR="$LOCK_ROOT/maintenance.lock.d"
 NEXT_ID_FILE="$QUEUE_ROOT/next_id"
 NAMESPACE_DIR="$QUEUE_ROOT/namespaces"
-LOCK_METHOD=""
+RECORD_LOCK_METHOD=""
+RECORD_LOCK_DIR=""
+COUNTER_LOCK_METHOD=""
+MAINTENANCE_LOCK_METHOD=""
 TEMP_PAYLOAD_FILE=""
 TEMP_RECORD_DIR=""
 TEMP_MESSAGE_DIR=""
@@ -67,6 +75,8 @@ Usage:
   iac-queue abort KEY [--long]
   iac-queue show KEY EXTERNAL_ID
   iac-queue label KEY [LABEL|--clear]
+  iac-queue cleanup DAYS
+  iac-queue purge-trash --yes
   iac-queue version
 
 Key input:
@@ -103,6 +113,10 @@ Queue behavior:
 
 Listings are FIFO. Without --long, listings print one external ID per line.
 The abort queue is read-only and contains automatically expired tasks.
+
+cleanup moves completed and aborted tasks at least DAYS old into the untracked
+trash directory. If cleanup is never run, terminal records are retained.
+purge-trash --yes permanently deletes every record currently in trash.
 
 Every task belongs to one caller-defined key. The key is mandatory for every
 task operation and listing. There is no unfiltered listing command.
@@ -148,6 +162,12 @@ sanitize_note() {
     printf '%s' "$*" | tr '\t\r\n' '   '
 }
 
+set_shared_directory_mode() {
+    if ! chmod 2770 "$@" 2>/dev/null; then
+        chmod 0770 "$@"
+    fi
+}
+
 ensure_runtime() {
     [[ "$MAX_MESSAGES" =~ ^[1-9][0-9]*$ ]] || {
         die "IAC_QUEUE_MAX_MESSAGES must be a positive integer"
@@ -156,46 +176,167 @@ ensure_runtime() {
         die "IAC_QUEUE_MAX_MESSAGE_BYTES must be a positive integer"
     }
 
-    umask 0027
+    umask 0007
     mkdir -p \
         "$BACKLOG_DIR" \
         "$INPROGRESS_DIR" \
         "$COMPLETED_DIR" \
         "$ABORT_DIR" \
+        "$TRASH_DIR" \
         "$NAMESPACE_DIR" \
-        "$LOG_DIR"
+        "$LOG_DIR" \
+        "$LOCK_ROOT" \
+        "$RECORD_LOCK_ROOT"
 }
 
-acquire_lock() {
-    local attempt
+record_lock_digest() {
+    local key_hash="$1"
+    local external_id="$2"
 
-    [[ -n "$LOCK_METHOD" ]] && return 0
+    printf '%s' "$key_hash:$external_id" | {
+        if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum | awk '{print $1}'
+        elif command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 | awk '{print $1}'
+        else
+            die "sha256sum or shasum is required"
+        fi
+    }
+}
+
+acquire_record_lock() {
+    local key_hash="$1"
+    local external_id="$2"
+    local mode="${3:-exclusive}"
+    local attempt
+    local digest
+    local lock_file
+
+    [[ -z "$RECORD_LOCK_METHOD" ]] || {
+        die "internal error: a record lock is already held"
+    }
+
+    digest="$(record_lock_digest "$key_hash" "$external_id")"
+    lock_file="$RECORD_LOCK_ROOT/$digest.lock"
+    RECORD_LOCK_DIR="$RECORD_LOCK_ROOT/$digest.lock.d"
 
     if command -v flock >/dev/null 2>&1; then
-        exec 9>"$LOCK_FILE"
-        flock -x 9
-        LOCK_METHOD="flock"
+        exec 8>"$lock_file"
+        if [[ "$mode" == "shared" ]]; then
+            flock -s 8
+        else
+            flock -x 8
+        fi
+        RECORD_LOCK_METHOD="flock"
         return 0
     fi
 
     for attempt in $(seq 1 200); do
-        if mkdir "$LOCK_DIR" 2>/dev/null; then
-            printf '%s\n' "$$" > "$LOCK_DIR/pid"
-            LOCK_METHOD="directory"
+        if mkdir "$RECORD_LOCK_DIR" 2>/dev/null; then
+            printf '%s\n' "$$" > "$RECORD_LOCK_DIR/pid"
+            RECORD_LOCK_METHOD="directory"
             return 0
         fi
         sleep 0.05
     done
 
-    die "timed out waiting for queue lock"
+    die "timed out waiting for record lock"
 }
 
-release_lock() {
-    if [[ "$LOCK_METHOD" == "directory" ]]; then
-        rm -f -- "$LOCK_DIR/pid"
-        rmdir -- "$LOCK_DIR" 2>/dev/null || true
-        LOCK_METHOD=""
+release_record_lock() {
+    if [[ "$RECORD_LOCK_METHOD" == "flock" ]]; then
+        flock -u 8
+        exec 8>&-
+    elif [[ "$RECORD_LOCK_METHOD" == "directory" ]]; then
+        rm -f -- "$RECORD_LOCK_DIR/pid"
+        rmdir -- "$RECORD_LOCK_DIR" 2>/dev/null || true
     fi
+    RECORD_LOCK_METHOD=""
+    RECORD_LOCK_DIR=""
+}
+
+acquire_counter_lock() {
+    local attempt
+
+    [[ -z "$COUNTER_LOCK_METHOD" ]] || return 0
+
+    if command -v flock >/dev/null 2>&1; then
+        exec 9>"$COUNTER_LOCK_FILE"
+        flock -x 9
+        COUNTER_LOCK_METHOD="flock"
+        return 0
+    fi
+
+    for attempt in $(seq 1 200); do
+        if mkdir "$COUNTER_LOCK_DIR" 2>/dev/null; then
+            printf '%s\n' "$$" > "$COUNTER_LOCK_DIR/pid"
+            COUNTER_LOCK_METHOD="directory"
+            return 0
+        fi
+        sleep 0.05
+    done
+
+    die "timed out waiting for internal ID counter lock"
+}
+
+release_counter_lock() {
+    if [[ "$COUNTER_LOCK_METHOD" == "flock" ]]; then
+        flock -u 9
+        exec 9>&-
+    elif [[ "$COUNTER_LOCK_METHOD" == "directory" ]]; then
+        rm -f -- "$COUNTER_LOCK_DIR/pid"
+        rmdir -- "$COUNTER_LOCK_DIR" 2>/dev/null || true
+    fi
+    COUNTER_LOCK_METHOD=""
+}
+
+acquire_maintenance_lock() {
+    local blocking="${1:-true}"
+
+    [[ -z "$MAINTENANCE_LOCK_METHOD" ]] || return 0
+
+    if command -v flock >/dev/null 2>&1; then
+        exec 7>"$MAINTENANCE_LOCK_FILE"
+        if [[ "$blocking" == "true" ]]; then
+            flock -x 7
+        elif ! flock -n -x 7; then
+            exec 7>&-
+            return 1
+        fi
+        MAINTENANCE_LOCK_METHOD="flock"
+        return 0
+    fi
+
+    if mkdir "$MAINTENANCE_LOCK_DIR" 2>/dev/null; then
+        printf '%s\n' "$$" > "$MAINTENANCE_LOCK_DIR/pid"
+        MAINTENANCE_LOCK_METHOD="directory"
+        return 0
+    fi
+
+    [[ "$blocking" == "false" ]] && return 1
+
+    local attempt
+    for attempt in $(seq 1 200); do
+        if mkdir "$MAINTENANCE_LOCK_DIR" 2>/dev/null; then
+            printf '%s\n' "$$" > "$MAINTENANCE_LOCK_DIR/pid"
+            MAINTENANCE_LOCK_METHOD="directory"
+            return 0
+        fi
+        sleep 0.05
+    done
+
+    die "timed out waiting for maintenance lock"
+}
+
+release_maintenance_lock() {
+    if [[ "$MAINTENANCE_LOCK_METHOD" == "flock" ]]; then
+        flock -u 7
+        exec 7>&-
+    elif [[ "$MAINTENANCE_LOCK_METHOD" == "directory" ]]; then
+        rm -f -- "$MAINTENANCE_LOCK_DIR/pid"
+        rmdir -- "$MAINTENANCE_LOCK_DIR" 2>/dev/null || true
+    fi
+    MAINTENANCE_LOCK_METHOD=""
 }
 
 cleanup_on_exit() {
@@ -211,7 +352,9 @@ cleanup_on_exit() {
         find "$TEMP_RECORD_DIR" -depth -delete
     fi
 
-    release_lock
+    release_record_lock
+    release_counter_lock
+    release_maintenance_lock
 }
 
 trap cleanup_on_exit EXIT
@@ -364,6 +507,7 @@ migrate_legacy_keys() {
     local item_path
     local legacy_key
     local key_hash
+    local external_id
     local temp_hash_file
 
     for state_dir in \
@@ -379,11 +523,19 @@ migrate_legacy_keys() {
             IFS= read -r legacy_key < "$item_path/key" || true
             validate_key "$legacy_key"
             key_hash="$(hash_key "$legacy_key")"
+            external_id="$(cat "$item_path/external_id" 2>/dev/null ||
+                basename "$item_path")"
+            acquire_record_lock "$key_hash" "$external_id"
+            if [[ ! -f "$item_path/key" ]]; then
+                release_record_lock
+                continue
+            fi
             temp_hash_file="$item_path/.key_sha256.$$"
             printf '%s\n' "$key_hash" > "$temp_hash_file"
             mv -- "$temp_hash_file" "$item_path/key_sha256"
             rm -f -- "$item_path/key"
             mkdir -p -- "$(namespace_path "$key_hash")"
+            release_record_lock
         done
         shopt -u nullglob
     done
@@ -393,6 +545,8 @@ allocate_queue_id() {
     local next_number="1"
     local new_next
     local temp_counter
+
+    acquire_counter_lock
 
     if [[ -f "$NEXT_ID_FILE" ]]; then
         IFS= read -r next_number < "$NEXT_ID_FILE" || true
@@ -408,6 +562,7 @@ allocate_queue_id() {
     temp_counter="$NEXT_ID_FILE.tmp.$$"
     printf '%s\n' "$new_next" > "$temp_counter"
     mv -- "$temp_counter" "$NEXT_ID_FILE"
+    release_counter_lock
 }
 
 find_item() {
@@ -567,6 +722,7 @@ enqueue_payload() {
 
     allocate_message_id "$item_path"
     temp_message="$(mktemp -d "$item_path/messages/.tmp.XXXXXX")"
+    set_shared_directory_mode "$temp_message"
     TEMP_MESSAGE_DIR="$temp_message"
     printf '%s\n' "$(now_iso)" > "$temp_message/created_at"
     printf '%s\n' "$(actor_name)" > "$temp_message/actor"
@@ -624,6 +780,7 @@ abort_stale_tasks() {
     local created_epoch
     local age_seconds
     local external_id
+    local key_hash
     local destination
 
     MAINTENANCE_ABORTED_COUNT=0
@@ -648,8 +805,16 @@ abort_stale_tasks() {
 
             [[ -f "$item_path/key_sha256" ]] || continue
             [[ -f "$item_path/external_id" ]] || continue
+            IFS= read -r key_hash < "$item_path/key_sha256" || true
             IFS= read -r external_id < "$item_path/external_id" || true
             queue_id="$(basename "$item_path")"
+            acquire_record_lock "$key_hash" "$external_id"
+
+            # The task may have changed state while this process waited.
+            if [[ ! -d "$item_path" ]]; then
+                release_record_lock
+                continue
+            fi
 
             flush_messages "$item_path"
             if (( FLUSHED_MESSAGES > 0 )); then
@@ -659,6 +824,7 @@ abort_stale_tasks() {
 
             printf '%s\n' "aborted" > "$item_path/result"
             printf '%s\n' "$(now_iso)" > "$item_path/updated_at"
+            printf '%s\n' "$(date '+%s')" > "$item_path/terminal_epoch"
             append_history "$item_path" "aborted" \
                 "$reason after $threshold_days day(s)"
 
@@ -667,6 +833,7 @@ abort_stale_tasks() {
             write_log "aborted" "$external_id" \
                 "$queue_id $reason after $threshold_days day(s)"
             MAINTENANCE_ABORTED_COUNT=$((MAINTENANCE_ABORTED_COUNT + 1))
+            release_record_lock
         done
         shopt -u nullglob
     done
@@ -696,6 +863,7 @@ cmd_install() {
     local git_root
     local relative_bin
     local relative_logs
+    local relative_trash
     local gitignore_file
 
     mkdir -p -- "$1"
@@ -703,15 +871,33 @@ cmd_install() {
     install_root="$target/iac-queue"
     destination="$install_root/bin/iac-queue"
 
-    umask 0027
+    umask 0007
     mkdir -p \
         "$install_root/bin" \
         "$install_root/logs" \
+        "$install_root/logs/locks" \
+        "$install_root/logs/locks/records" \
         "$install_root/queue/backlog" \
         "$install_root/queue/inprogress" \
         "$install_root/queue/completed" \
         "$install_root/queue/abort" \
+        "$install_root/queue/trash" \
         "$install_root/queue/namespaces"
+
+    set_shared_directory_mode \
+        "$install_root/logs" \
+        "$install_root/logs/locks" \
+        "$install_root/logs/locks/records" \
+        "$install_root/queue" \
+        "$install_root/queue/backlog" \
+        "$install_root/queue/inprogress" \
+        "$install_root/queue/completed" \
+        "$install_root/queue/abort" \
+        "$install_root/queue/trash" \
+        "$install_root/queue/namespaces"
+
+    # Upgrade existing installations for shared group operation.
+    chmod -R g+rwX "$install_root/logs" "$install_root/queue"
 
     touch \
         "$install_root/queue/backlog/.gitkeep" \
@@ -732,12 +918,16 @@ cmd_install() {
         gitignore_file="$git_root/.gitignore"
         relative_bin="${install_root#"$git_root"/}/bin"
         relative_logs="${install_root#"$git_root"/}/logs"
+        relative_trash="${install_root#"$git_root"/}/queue/trash"
 
         append_gitignore_entry "$gitignore_file" "/$relative_bin/"
         append_gitignore_entry "$gitignore_file" "/$relative_logs/"
+        append_gitignore_entry "$gitignore_file" "/$relative_trash/"
 
         printf 'Updated Git ignore file: %s\n' "$gitignore_file"
-        printf 'Queue data remains visible to Git: %s\n' "$install_root/queue"
+        printf 'Active and terminal queue data remains visible to Git: %s\n' \
+            "$install_root/queue"
+        printf 'Trash data is ignored by Git: %s\n' "$install_root/queue/trash"
     else
         printf 'Target is not inside a Git worktree; no .gitignore was changed.\n'
     fi
@@ -761,7 +951,7 @@ cmd_add() {
     validate_external_id "$external_id"
 
     ensure_runtime
-    acquire_lock
+    acquire_record_lock "$key_hash" "$external_id"
 
     if find_item "$key_hash" "$external_id"; then
         printf '%s already exists as %s in %s; add ignored.\n' \
@@ -773,6 +963,7 @@ cmd_add() {
 
     allocate_queue_id
     temp_path="$(mktemp -d "$BACKLOG_DIR/.${QUEUE_ID}.tmp.XXXXXX")"
+    set_shared_directory_mode "$temp_path"
     TEMP_RECORD_DIR="$temp_path"
     created_at="$(now_iso)"
 
@@ -818,7 +1009,7 @@ cmd_cancel() {
     validate_key_hash "$key_hash"
     validate_external_id "$external_id"
     ensure_runtime
-    acquire_lock
+    acquire_record_lock "$key_hash" "$external_id"
 
     if ! find_item "$key_hash" "$external_id"; then
         printf '%s does not exist; cancel ignored.\n' "$external_id"
@@ -844,6 +1035,7 @@ cmd_cancel() {
     mv -- "$ITEM_PATH" "$destination"
     printf '%s\n' "cancelled" > "$destination/result"
     printf '%s\n' "$(now_iso)" > "$destination/updated_at"
+    printf '%s\n' "$(date '+%s')" > "$destination/terminal_epoch"
     append_history "$destination" "cancelled" "$note"
 
     write_log "cancelled" "$external_id" "$ITEM_QUEUE_ID $note"
@@ -863,7 +1055,7 @@ cmd_start() {
     validate_key_hash "$key_hash"
     validate_external_id "$external_id"
     ensure_runtime
-    acquire_lock
+    acquire_record_lock "$key_hash" "$external_id"
 
     find_item "$key_hash" "$external_id" || {
         die "task '$external_id' does not exist for the supplied key"
@@ -910,7 +1102,7 @@ cmd_complete() {
     validate_key_hash "$key_hash"
     validate_external_id "$external_id"
     ensure_runtime
-    acquire_lock
+    acquire_record_lock "$key_hash" "$external_id"
 
     find_item "$key_hash" "$external_id" || {
         die "task '$external_id' does not exist for the supplied key"
@@ -943,6 +1135,7 @@ cmd_complete() {
     mv -- "$ITEM_PATH" "$destination"
     printf '%s\n' "success" > "$destination/result"
     printf '%s\n' "$(now_iso)" > "$destination/updated_at"
+    printf '%s\n' "$(date '+%s')" > "$destination/terminal_epoch"
     append_history "$destination" "completed" "$note"
 
     write_log "completed" "$external_id" "$ITEM_QUEUE_ID $note"
@@ -978,7 +1171,7 @@ cmd_push() {
     validate_key_hash "$key_hash"
     validate_external_id "$external_id"
     ensure_runtime
-    acquire_lock
+    acquire_record_lock "$key_hash" "$external_id"
     require_open_task "$key_hash" "$external_id"
 
     payload_file="$ITEM_PATH/.incoming-message.$$"
@@ -1007,7 +1200,7 @@ cmd_peek() {
     validate_key_hash "$key_hash"
     validate_external_id "$external_id"
     ensure_runtime
-    acquire_lock
+    acquire_record_lock "$key_hash" "$external_id" shared
     require_open_task "$key_hash" "$external_id"
 
     if ! find_oldest_message "$ITEM_PATH"; then
@@ -1028,7 +1221,7 @@ cmd_shift() {
     validate_key_hash "$key_hash"
     validate_external_id "$external_id"
     ensure_runtime
-    acquire_lock
+    acquire_record_lock "$key_hash" "$external_id"
     require_open_task "$key_hash" "$external_id"
 
     if ! find_oldest_message "$ITEM_PATH"; then
@@ -1055,6 +1248,7 @@ list_state() {
     local key_hash="$1"
     shift
     local long_output="false"
+    local show_queue_id="false"
     local state_dir
     local item_path
     local queue_id
@@ -1069,14 +1263,27 @@ list_state() {
     local result
     local messages
     local rows=()
+    local output_rows=()
 
     validate_key_hash "$key_hash"
 
-    if [[ $# -gt 0 ]]; then
-        [[ $# -eq 1 && "$1" == "--long" ]] || {
-            die "only --long is supported for queue listings"
-        }
-        long_output="true"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --long)
+                long_output="true"
+                ;;
+            --show-queueid|--display-queue-id)
+                show_queue_id="true"
+                ;;
+            *)
+                die "unsupported queue listing option '$1'"
+                ;;
+        esac
+        shift
+    done
+
+    if [[ "$show_queue_id" == "true" && "$long_output" != "true" ]]; then
+        die "--show-queueid and --display-queue-id require --long"
     fi
 
     case "$state" in
@@ -1088,7 +1295,6 @@ list_state() {
     esac
 
     ensure_runtime
-    acquire_lock
     now_epoch="$(date '+%s')"
 
     shopt -s nullglob
@@ -1105,10 +1311,25 @@ list_state() {
     shopt -u nullglob
 
     if [[ "$long_output" == "true" ]]; then
-        printf 'QUEUE_ID\tLABEL\tEXTERNAL_ID\tSTATE\tCREATED\tAGE_DAYS\tRESULT\tMESSAGES\n'
+        if [[ "$show_queue_id" == "true" ]]; then
+            output_rows+=(
+                $'QUEUE_ID\tLABEL\tEXTERNAL_ID\tSTATE\tCREATED\tAGE_DAYS\tRESULT\tMESSAGES'
+            )
+        else
+            output_rows+=(
+                $'LABEL\tEXTERNAL_ID\tSTATE\tCREATED\tAGE_DAYS\tRESULT\tMESSAGES'
+            )
+        fi
     fi
 
     if [[ ${#rows[@]} -eq 0 ]]; then
+        if [[ "$long_output" == "true" ]]; then
+            if command -v column >/dev/null 2>&1; then
+                printf '%s\n' "${output_rows[@]}" | column -t -s $'\t'
+            else
+                printf '%s\n' "${output_rows[@]}"
+            fi
+        fi
         return 0
     fi
 
@@ -1128,19 +1349,27 @@ list_state() {
             fi
             result="$(cat "$item_path/result" 2>/dev/null || true)"
             messages="$(message_count "$item_path")"
-            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-                "$queue_id" \
-                "$label" \
-                "$external_id" \
-                "$state" \
-                "$created" \
-                "$age_days" \
-                "${result:--}" \
-                "$messages"
+            if [[ "$show_queue_id" == "true" ]]; then
+                output_rows+=(
+                    "$queue_id"$'\t'"$label"$'\t'"$external_id"$'\t'"$state"$'\t'"$created"$'\t'"$age_days"$'\t'"${result:--}"$'\t'"$messages"
+                )
+            else
+                output_rows+=(
+                    "$label"$'\t'"$external_id"$'\t'"$state"$'\t'"$created"$'\t'"$age_days"$'\t'"${result:--}"$'\t'"$messages"
+                )
+            fi
         else
             printf '%s\n' "$external_id"
         fi
     done < <(printf '%s\n' "${rows[@]}" | LC_ALL=C sort -k1,1n -k2,2)
+
+    if [[ "$long_output" == "true" ]]; then
+        if command -v column >/dev/null 2>&1; then
+            printf '%s\n' "${output_rows[@]}" | column -t -s $'\t'
+        else
+            printf '%s\n' "${output_rows[@]}"
+        fi
+    fi
 }
 
 cmd_show() {
@@ -1160,7 +1389,7 @@ cmd_show() {
     validate_external_id "$external_id"
 
     ensure_runtime
-    acquire_lock
+    acquire_record_lock "$key_hash" "$external_id" shared
     find_item "$key_hash" "$external_id" || {
         die "task '$external_id' does not exist for the supplied key"
     }
@@ -1203,7 +1432,7 @@ cmd_label() {
 
     validate_key_hash "$key_hash"
     ensure_runtime
-    acquire_lock
+    acquire_record_lock "$key_hash" "__namespace_label__"
 
     namespace="$(namespace_path "$key_hash")"
     label_file="$namespace/label"
@@ -1233,11 +1462,138 @@ cmd_prune() {
     [[ $# -eq 0 ]] || die "--prune does not accept arguments"
 
     ensure_runtime
-    acquire_lock
+    acquire_maintenance_lock true
     migrate_legacy_keys
     abort_stale_tasks "$PRUNE_MINIMUM_DAYS" "manual-prune"
     printf 'Pruned %s task(s) aged at least %s days.\n' \
         "$MAINTENANCE_ABORTED_COUNT" "$PRUNE_MINIMUM_DAYS"
+}
+
+terminal_record_epoch() {
+    local item_path="$1"
+    local epoch=""
+
+    if [[ -f "$item_path/terminal_epoch" ]]; then
+        IFS= read -r epoch < "$item_path/terminal_epoch" || true
+    fi
+
+    if [[ "$epoch" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "$epoch"
+        return 0
+    fi
+
+    # Compatibility for records completed before terminal_epoch was added.
+    if [[ -f "$item_path/result" ]]; then
+        if epoch="$(stat -c '%Y' "$item_path/result" 2>/dev/null)" ||
+           epoch="$(stat -f '%m' "$item_path/result" 2>/dev/null)"; then
+            if [[ "$epoch" =~ ^[0-9]+$ ]]; then
+                printf '%s\n' "$epoch"
+                return 0
+            fi
+        fi
+    fi
+
+    return 1
+}
+
+cmd_cleanup() {
+    [[ $# -eq 1 ]] || die "cleanup requires one DAYS value"
+    [[ "$1" =~ ^[0-9]+$ ]] || die "cleanup DAYS must be zero or a positive integer"
+
+    local retention_days="$1"
+    local threshold_seconds="$((retention_days * 86400))"
+    local now_epoch
+    local state
+    local state_dir
+    local item_path
+    local queue_id
+    local external_id
+    local terminal_epoch
+    local age_seconds
+    local destination
+    local moved_count=0
+
+    ensure_runtime
+    acquire_maintenance_lock true
+    now_epoch="$(date '+%s')"
+
+    for state in completed abort; do
+        case "$state" in
+            completed) state_dir="$COMPLETED_DIR" ;;
+            abort) state_dir="$ABORT_DIR" ;;
+        esac
+
+        shopt -s nullglob
+        for item_path in "$state_dir"/*; do
+            [[ -d "$item_path" ]] || continue
+            terminal_epoch="$(terminal_record_epoch "$item_path" || true)"
+            [[ "$terminal_epoch" =~ ^[0-9]+$ ]] || continue
+            age_seconds="$((now_epoch - terminal_epoch))"
+            (( age_seconds >= threshold_seconds )) || continue
+
+            queue_id="$(basename "$item_path")"
+            key_hash="$(cat "$item_path/key_sha256" 2>/dev/null || true)"
+            external_id="$(cat "$item_path/external_id" 2>/dev/null || printf '-')"
+            [[ "$key_hash" =~ ^[0-9a-f]{64}$ ]] || continue
+            acquire_record_lock "$key_hash" "$external_id"
+
+            # Another process may already have moved this terminal record.
+            if [[ ! -d "$item_path" ]]; then
+                release_record_lock
+                continue
+            fi
+
+            destination="$TRASH_DIR/$queue_id"
+            [[ ! -e "$destination" ]] || {
+                die "trash already contains queue record $queue_id"
+            }
+
+            printf '%s\n' "$(now_iso)" > "$item_path/updated_at"
+            append_history "$item_path" "trashed" \
+                "$state record retained for at least $retention_days day(s)"
+            mv -- "$item_path" "$destination"
+            write_log "trashed" "$external_id" \
+                "$queue_id from $state after $retention_days day(s)"
+            moved_count=$((moved_count + 1))
+            release_record_lock
+        done
+        shopt -u nullglob
+    done
+
+    printf 'Moved %s terminal task(s) to trash.\n' "$moved_count"
+}
+
+cmd_purge_trash() {
+    [[ $# -eq 1 && "$1" == "--yes" ]] || {
+        die "purge-trash permanently deletes trash; confirm with --yes"
+    }
+
+    local item_path
+    local purged_count=0
+
+    ensure_runtime
+    acquire_maintenance_lock true
+
+    shopt -s nullglob
+    for item_path in "$TRASH_DIR"/*; do
+        [[ -d "$item_path" ]] || continue
+        find "$item_path" -depth -delete
+        purged_count=$((purged_count + 1))
+    done
+    shopt -u nullglob
+
+    write_log "trash-purged" "-" "$purged_count record(s)"
+    printf 'Permanently deleted %s task(s) from trash.\n' "$purged_count"
+}
+
+run_automatic_maintenance() {
+    if ! acquire_maintenance_lock false; then
+        return 0
+    fi
+
+    migrate_legacy_keys
+    abort_stale_tasks "$AUTO_ABORT_DAYS" "automatic-expiration"
+    release_maintenance_lock
 }
 
 main() {
@@ -1277,13 +1633,11 @@ main() {
     fi
 
     case "$command" in
-        install|version|--version|-V|help|--help|-h|--prune)
+        install|version|--version|-V|help|--help|-h|--prune|cleanup|purge-trash)
             ;;
         *)
             ensure_runtime
-            acquire_lock
-            migrate_legacy_keys
-            abort_stale_tasks "$AUTO_ABORT_DAYS" "automatic-expiration"
+            run_automatic_maintenance
             ;;
     esac
 
@@ -1302,6 +1656,8 @@ main() {
         abort) list_state "abort" "$@" ;;
         show) cmd_show "$@" ;;
         label) cmd_label "$@" ;;
+        cleanup) cmd_cleanup "$@" ;;
+        purge-trash) cmd_purge_trash "$@" ;;
         --prune) cmd_prune "$@" ;;
         version|--version|-V)
             printf '%s %s\n' "$PROGRAM" "$VERSION"
